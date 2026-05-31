@@ -1,10 +1,10 @@
-"""Frozen MiniLM embedder + sklearn LogisticRegression head. Needs labels; CPU-only."""
+"""Lightweight LLM router: frozen MiniLM embedder + LogisticRegression head. CPU-only."""
 import numpy as np
 from sentence_transformers import SentenceTransformer
 from sklearn.linear_model import LogisticRegression
 
 
-class EmbeddingTrainedRouter:
+class Router:
     def __init__(self, model_name="all-MiniLM-L6-v2"):
         self.embedder = SentenceTransformer(model_name)
         self.clf = None
