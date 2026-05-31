@@ -1,25 +1,8 @@
-"""
-Option C: Zero-shot embedding router (no training, no labels).
-
-Recovers the LLM's "zero-shot flexibility" WITHOUT an LLM.
-
-Idea:
-  - Use a pre-trained sentence embedder (all-MiniLM-L6-v2, ~22.7M params, CPU).
-  - Embed each ROUTE DESCRIPTION once (verbatim from the repo's route_config).
-  - At query time: embed the prompt, route to the nearest route description by
-    cosine similarity.
-  - To add a brand-new route: just write a description and embed it. No labels,
-    no retraining. <-- this is the thing TF-IDF/logreg cannot do.
-
-The route descriptions below are copied verbatim from
-src/nat_sfc_router/functions/hf_intent_objective_fn.py (route_config), plus an
-"other" catch-all. Image-bearing prompts are handled by the same metadata rule
-the intent router relies on (the router redacts images but uses text cues).
-"""
+"""Zero-shot router: cosine-match a prompt embedding to route descriptions. No training."""
 import numpy as np
 from sentence_transformers import SentenceTransformer
 
-# Verbatim from repo route_config (descriptions are the LLM's only "spec" too)
+# Descriptions from repo route_config + an "other" catch-all.
 ROUTE_DESCRIPTIONS = {
     "hard_question": "A question that requires deep reasoning, or complex problem "
                      "solving, or if the user asks for careful thinking or careful consideration",
@@ -40,40 +23,23 @@ class EmbeddingZeroShotRouter:
         self.set_routes(route_descriptions or ROUTE_DESCRIPTIONS)
 
     def set_routes(self, route_descriptions: dict):
-        """(Re)define routes from descriptions only. This is the zero-shot path:
-        adding/removing a route here requires NO labeled data and NO retraining."""
+        self.descriptions = dict(route_descriptions)
         self.routes = list(route_descriptions.keys())
         descs = [route_descriptions[r] for r in self.routes]
         self.route_vecs = self.model.encode(descs, normalize_embeddings=True)
 
     def add_route(self, name: str, description: str):
-        """Zero-shot add: provide a name + one sentence. No examples needed."""
-        d = {r: desc for r, desc in zip(self.routes, self._descs())}
-        d[name] = description
-        self.set_routes(d)
-
-    def _descs(self):
-        # not stored separately; reconstruct is unnecessary because set_routes
-        # always passes full dict. Kept for add_route convenience.
-        return [ROUTE_DESCRIPTIONS.get(r, "") for r in self.routes]
+        self.set_routes({**self.descriptions, name: description})
 
     def predict(self, text: str, has_image: bool = False) -> str:
         qv = self.model.encode([text or ""], normalize_embeddings=True)[0]
-        sims = self.route_vecs @ qv  # cosine (vectors are normalized)
-
+        sims = self.route_vecs @ qv
         if has_image:
-            # restrict to image-capable routes when an image is attached
             idxs = [i for i, r in enumerate(self.routes) if r in self.image_routes]
-            if idxs:
-                best = max(idxs, key=lambda i: sims[i])
-                return self.routes[best]
         else:
-            # exclude image-only routes when there's no image
             idxs = [i for i, r in enumerate(self.routes) if r not in self.image_routes]
-            if idxs:
-                best = max(idxs, key=lambda i: sims[i])
-                return self.routes[best]
-
+        if idxs:
+            return self.routes[max(idxs, key=lambda i: sims[i])]
         return self.routes[int(np.argmax(sims))]
 
     def num_params(self):

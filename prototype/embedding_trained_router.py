@@ -1,14 +1,4 @@
-"""
-Option B: Pre-trained frozen embedder + small trained classifier head.
-
-- Embedder: all-MiniLM-L6-v2 (~22.7M params), FROZEN, CPU. Pre-trained by others.
-- Head: sklearn LogisticRegression on the 384-d embeddings (+ has_image feature).
-  Tiny (a few thousand floats), trains in milliseconds.
-
-This is the "distill into a small head on top of strong pretrained features" point.
-It needs labels to train the head, so it is NOT zero-shot for new routes — but it is
-far more accurate than raw description-matching, and still GPU-free.
-"""
+"""Frozen MiniLM embedder + sklearn LogisticRegression head. Needs labels; CPU-only."""
 import numpy as np
 from sentence_transformers import SentenceTransformer
 from sklearn.linear_model import LogisticRegression

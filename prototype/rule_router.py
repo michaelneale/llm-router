@@ -1,15 +1,4 @@
-"""
-Zero-ML rule-based router (lightest possible).
-
-No model, no training, no GPU, ~0 ms. Pure heuristics over the prompt text
-plus the `has_image` metadata flag. Mirrors the cheap-signal idea from the
-design discussion:
-  - image attached            -> route via image intent
-  - explicit "wrong/try again" -> try_again
-  - reasoning/proof keywords   -> hard_question
-  - short greetings/social     -> chit_chat
-  - else                       -> other
-"""
+"""Zero-ML keyword/heuristic router over prompt text + has_image flag."""
 import re
 
 REASONING_KW = re.compile(

@@ -1,19 +1,4 @@
-"""
-Benchmark lightweight routers vs the 1.7B Qwen intent router.
-
-Metrics:
-  - Intent accuracy: exact route label match (6-way classification)
-  - Model-decision accuracy: does it pick the SAME downstream model? (the
-    thing that actually matters for cost/latency). Collapses 6 intents -> 3 models.
-  - Latency: p50 / p95 per prediction (CPU)
-  - Size: params / on-disk footprint
-
-Validation:
-  - rule router: evaluated on the full set (no training, so no leakage)
-  - tfidf+lr router: stratified k-fold cross-validation (honest held-out accuracy)
-
-Qwen 1.7B numbers are characteristics (not measured here) for context.
-"""
+"""Stdlib-only benchmark: rule + tfidf routers. Intent/model accuracy, latency, size."""
 import time
 import random
 import statistics

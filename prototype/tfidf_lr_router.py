@@ -1,18 +1,4 @@
-"""
-Tiny TF-IDF + multinomial logistic regression router, pure-stdlib (no numpy/sklearn).
-
-This is the "distill into a small CPU classifier" option from the design
-discussion, implemented with zero ML dependencies so it runs anywhere.
-
-Pipeline:
-  text -> word/char features (unigrams + bigrams + has_image flag)
-       -> TF-IDF weighting
-       -> softmax linear classifier (trained by gradient descent)
-       -> intent label
-
-Everything is plain Python dicts/lists. Model size = vocabulary x classes
-floats, which we report at the end.
-"""
+"""TF-IDF + multinomial logistic regression, pure stdlib (no numpy/sklearn)."""
 import math
 import re
 import random

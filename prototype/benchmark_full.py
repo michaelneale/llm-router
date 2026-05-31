@@ -1,19 +1,4 @@
-"""
-Unified benchmark: 5 router strategies vs the 1.7B Qwen reference.
-
-Routers:
-  1. rule baseline (0-ML)                  - heuristics, no model
-  2. tfidf + logreg (from scratch)         - pure stdlib
-  3. embedding + sklearn logreg head       - frozen MiniLM + trained head (Option B)
-  4. embedding zero-shot (desc matching)   - frozen MiniLM, NO training (Option C)
-  5. Qwen3-1.7B (reference)                - the existing LLM router (characteristics only)
-
-Metrics: intent acc (6-way), model acc (3-way, drives cost), latency p50/p95,
-params/footprint, GPU need, and FLEXIBILITY (can add a route with zero labeled data?).
-
-Trained models (2,3) use stratified 5-fold CV for honest held-out accuracy.
-Zero-shot (4) and rule (1) need no training, evaluated on the full set.
-"""
+"""Benchmark 5 routers (rule, tfidf, embedding+head, zero-shot, Qwen ref): accuracy, latency, size."""
 import time, random, statistics
 from collections import defaultdict
 

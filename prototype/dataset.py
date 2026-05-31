@@ -1,26 +1,4 @@
-"""
-Labeled prompt dataset for the lightweight router prototype.
-
-Ground-truth routes are taken verbatim from the repo's intent router
-(src/nat_sfc_router/functions/hf_intent_objective_fn.py):
-
-    route_config names: hard_question, chit_chat, try_again,
-                        image_understanding, image_question
-    plus the implicit "other" fallback.
-
-MAP_INTENT_TO_PIPELINE (the decision the router ultimately makes):
-    other               -> nvidia/nvidia-nemotron-nano-9b-v2   (cheap LLM)
-    chit_chat           -> nvidia/nvidia-nemotron-nano-9b-v2   (cheap LLM)
-    hard_question       -> gpt-5-chat                          (frontier)
-    try_again           -> gpt-5-chat                          (frontier)
-    image_understanding -> nvidia/nemotron-nano-12b-v2-vl      (VLM)
-    image_question      -> nvidia/nemotron-nano-12b-v2-vl      (VLM)
-
-This dataset is curated to match those category *descriptions*. It is a
-self-consistent stand-in for labeling traffic with the real 1.7B Qwen router
-(which is not running in this environment). Each example optionally carries a
-`has_image` flag, mirroring the multimodal input the real router sees.
-"""
+"""Curated (prompt, intent, has_image) labels. Routes/mapping match the repo's intent router."""
 
 MAP_INTENT_TO_PIPELINE = {
     "other": "nvidia/nvidia-nemotron-nano-9b-v2",
