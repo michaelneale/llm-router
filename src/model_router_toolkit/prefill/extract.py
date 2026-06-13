@@ -200,13 +200,18 @@ class PrefillExtractor:
             "cache_dir": cd,
             "trust_remote_code": True,
         }
-        if self._device != "cpu":
+        # For a single CUDA device, device_map="auto" (needs `accelerate`) is
+        # convenient for sharding. For MPS / single-device we just move the
+        # model explicitly with .to(device) — no accelerate dependency.
+        if self._device == "cuda":
             load_kwargs["device_map"] = "auto"
 
         self._model = AutoModelForCausalLM.from_pretrained(
             self._hf_path,
             **load_kwargs,
         )
+        if self._device in ("mps", "cpu"):
+            self._model = self._model.to(self._device)
         self._model.eval()
 
         cfg = self._model.config

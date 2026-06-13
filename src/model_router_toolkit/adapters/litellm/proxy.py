@@ -106,59 +106,174 @@ def start_proxy(
 
     from litellm.proxy.proxy_server import app as litellm_app
 
+    from model_router_toolkit.adapters.litellm.savings import (
+        extract_usage,
+        extract_usage_from_sse,
+        get_tracker,
+    )
+
+    tracker = get_tracker()
     _strategy_ref = None
 
-    @litellm_app.on_event("startup")
-    async def _inject_routing_strategy():
+    # litellm >= ~1.60 uses a lifespan context; legacy @app.on_event("startup")
+    # handlers are silently ignored when a custom lifespan is set. Wrap the
+    # existing lifespan so injection runs after litellm initializes its Router.
+    from contextlib import asynccontextmanager
+
+    _original_lifespan = litellm_app.router.lifespan_context
+
+    @asynccontextmanager
+    async def _routing_lifespan(app):
         nonlocal _strategy_ref
-        try:
-            _strategy_ref = _inject_strategy(router_config_abs)
-        except Exception:
-            logger.exception("Failed to inject routing strategy at startup")
+        async with _original_lifespan(app) as state:
+            try:
+                _strategy_ref = _inject_strategy(router_config_abs)
+            except Exception:
+                logger.exception("Failed to inject routing strategy at startup")
+            yield state
+
+    litellm_app.router.lifespan_context = _routing_lifespan
+
+    import json as _json
+
+    _COMPLETION_PATHS = ("/chat/completions", "/completions", "/v1/chat/completions",
+                         "/v1/completions")
 
     class _RouterProxyMiddleware(BaseHTTPMiddleware):
         """Patch the response ``model`` field to reflect the actual routed
-        model (litellm echoes the request model name, not the deployment).
+        model (litellm echoes the request model name, not the deployment) and
+        record real token usage for the savings tracker.
+
+        Handles both non-streaming JSON responses and streaming SSE responses.
+        For streaming, we force ``stream_options.include_usage`` on the inbound
+        request so the upstream emits a final usage chunk, then tap the SSE
+        stream as it passes through to read it — without buffering the whole
+        response, so interactive streaming stays live.
         """
 
         async def dispatch(self, request: Request, call_next) -> Response:
+            # 1. For completion requests, force include_usage on streaming so we
+            #    can count tokens. We must read + replace the request body.
+            if any(request.url.path.endswith(p) for p in _COMPLETION_PATHS):
+                raw = await request.body()
+                new_raw = _force_include_usage(raw)
+                if new_raw is not raw:
+                    # Re-serve the (possibly modified) body to downstream handlers.
+                    async def _receive():
+                        return {"type": "http.request", "body": new_raw,
+                                "more_body": False}
+
+                    request = Request(request.scope, _receive)
 
             response = await call_next(request)
 
             strategy = _strategy_ref
-            if strategy and hasattr(strategy, "last_result") and strategy.last_result:
-                selected = strategy.last_result.selected_model
-                response.headers["X-Model-Router-Selected"] = selected
+            if not (strategy and getattr(strategy, "last_result", None)):
+                return response
 
-                if response.headers.get("content-type", "").startswith("application/json"):
-                    body = b""
-                    async for chunk in response.body_iterator:
-                        body += chunk if isinstance(chunk, bytes) else chunk.encode()
+            result = strategy.last_result
+            selected = result.selected_model
+            response.headers["X-Model-Router-Selected"] = selected
+            content_type = response.headers.get("content-type", "")
 
-                    import json as _json
+            # --- Non-streaming JSON ---
+            if content_type.startswith("application/json"):
+                body = b""
+                async for chunk in response.body_iterator:
+                    body += chunk if isinstance(chunk, bytes) else chunk.encode()
 
-                    try:
-                        data = _json.loads(body)
-                        data["model"] = selected
-                        body = _json.dumps(data).encode()
-                    except (ValueError, KeyError):
-                        pass
+                try:
+                    data = _json.loads(body)
+                    data["model"] = selected
+                    body = _json.dumps(data).encode()
+                except (ValueError, KeyError):
+                    pass
 
-                    headers = dict(response.headers)
-                    headers["content-length"] = str(len(body))
+                usage = extract_usage(body)
+                if usage is not None:
+                    tracker.record(result, usage[0], usage[1])
 
-                    from starlette.responses import Response as StarletteResponse
+                headers = dict(response.headers)
+                headers["content-length"] = str(len(body))
 
-                    return StarletteResponse(
-                        content=body,
-                        status_code=response.status_code,
-                        headers=headers,
-                        media_type=response.media_type,
-                    )
+                from starlette.responses import Response as StarletteResponse
+
+                return StarletteResponse(
+                    content=body,
+                    status_code=response.status_code,
+                    headers=headers,
+                    media_type=response.media_type,
+                )
+
+            # --- Streaming SSE: pass chunks through live, tap for usage ---
+            if "text/event-stream" in content_type:
+                from starlette.responses import StreamingResponse
+
+                upstream = response.body_iterator
+
+                async def _tap():
+                    buf_parts: list[str] = []
+                    async for chunk in upstream:
+                        text = chunk.decode() if isinstance(chunk, bytes) else chunk
+                        buf_parts.append(text)
+                        yield chunk
+                    # Stream finished — extract usage from the accumulated SSE.
+                    usage = extract_usage_from_sse("".join(buf_parts))
+                    if usage is not None:
+                        tracker.record(result, usage[0], usage[1])
+
+                headers = dict(response.headers)
+                headers.pop("content-length", None)
+                return StreamingResponse(
+                    _tap(),
+                    status_code=response.status_code,
+                    headers=headers,
+                    media_type=response.media_type,
+                )
 
             return response
 
+    def _force_include_usage(raw: bytes):
+        """If the request is a streaming completion, set
+        ``stream_options.include_usage=true`` so the upstream emits usage.
+
+        Returns the original ``raw`` unchanged if no edit is needed, else new bytes.
+        """
+        if not raw:
+            return raw
+        try:
+            data = _json.loads(raw)
+        except (ValueError, TypeError):
+            return raw
+        if not isinstance(data, dict) or not data.get("stream"):
+            return raw
+        opts = data.get("stream_options")
+        if not isinstance(opts, dict):
+            opts = {}
+        if opts.get("include_usage") is True:
+            return raw
+        opts["include_usage"] = True
+        data["stream_options"] = opts
+        return _json.dumps(data).encode()
+
     litellm_app.add_middleware(_RouterProxyMiddleware)
+
+    from starlette.responses import HTMLResponse, JSONResponse
+
+    from model_router_toolkit.adapters.litellm.dashboard import DASHBOARD_HTML
+
+    @litellm_app.get("/savings")
+    async def _savings():  # noqa: ANN202
+        return JSONResponse(tracker.snapshot())
+
+    @litellm_app.post("/savings/reset")
+    async def _savings_reset():  # noqa: ANN202
+        tracker.reset()
+        return JSONResponse({"status": "reset"})
+
+    @litellm_app.get("/dashboard")
+    async def _dashboard():  # noqa: ANN202
+        return HTMLResponse(DASHBOARD_HTML)
 
     import uvicorn
 

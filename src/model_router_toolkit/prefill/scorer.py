@@ -6,6 +6,7 @@ score() call that returns P(correct) and cost estimates per target model.
 
 from __future__ import annotations
 
+import threading
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any
@@ -36,7 +37,15 @@ class PrefillScorer:
         self._trunk_nets: list[SharedTrunkNet] = []
         self._extractor: PrefillExtractor | None = None
         self.model_names: list[str] = []
-        self._device = "cpu"
+        import os
+
+        self._device = os.environ.get("ROUTER_DEVICE", "").lower() or "cpu"
+        # MPS Metal command buffers are NOT safe for concurrent encoding. Under
+        # the async proxy (uvicorn runs sync route() calls in a threadpool),
+        # parallel forward passes trigger:
+        #   "A command encoder is already encoding to this command buffer"
+        # and abort the process. Serialize all extraction with a lock.
+        self._infer_lock = threading.Lock()
 
     def _ensure_loaded(self) -> None:
         if self._ckpt is not None:
@@ -64,29 +73,34 @@ class PrefillScorer:
 
         needed_layers = self._needed_layers()
 
-        # Cache extraction results by (encoder, template_kwargs) combo
-        extraction_cache: dict[str, PrefillResult] = {}
-        per_model_feats: dict[str, np.ndarray] = {}
+        # Serialize the encoder forward pass + trunk scoring: MPS Metal buffers
+        # cannot be encoded concurrently, and torch ops aren't thread-safe to
+        # interleave across the shared model. The heavy work is the encoder; the
+        # lock makes concurrent proxy requests queue rather than crash.
+        with self._infer_lock:
+            # Cache extraction results by (encoder, template_kwargs) combo
+            extraction_cache: dict[str, PrefillResult] = {}
+            per_model_feats: dict[str, np.ndarray] = {}
 
-        for mname in self.model_names:
-            t = self._ckpt["transforms"][mname]
-            encoder = t["encoder"]
-            tpl_kwargs = t.get("chat_template_kwargs", {})
-            cache_key = f"{encoder}:{sorted(tpl_kwargs.items())}"
+            for mname in self.model_names:
+                t = self._ckpt["transforms"][mname]
+                encoder = t["encoder"]
+                tpl_kwargs = t.get("chat_template_kwargs", {})
+                cache_key = f"{encoder}:{sorted(tpl_kwargs.items())}"
 
-            if cache_key not in extraction_cache:
-                extraction_cache[cache_key] = self._extractor.extract(
-                    question,
-                    chat_template_kwargs=tpl_kwargs,
-                    extract_layers=needed_layers,
-                )
+                if cache_key not in extraction_cache:
+                    extraction_cache[cache_key] = self._extractor.extract(
+                        question,
+                        chat_template_kwargs=tpl_kwargs,
+                        extract_layers=needed_layers,
+                    )
 
-            result = extraction_cache[cache_key]
-            feat = build_features(result, t["layer"], t["mode"], t["scaler"], t["pca"])
-            per_model_feats[mname] = feat
+                result = extraction_cache[cache_key]
+                feat = build_features(result, t["layer"], t["mode"], t["scaler"], t["pca"])
+                per_model_feats[mname] = feat
 
-        shared_feats = np.hstack([per_model_feats[m] for m in self.model_names])
-        probs = predict_proba(self._trunk_nets, shared_feats, device=self._device)
+            shared_feats = np.hstack([per_model_feats[m] for m in self.model_names])
+            probs = predict_proba(self._trunk_nets, shared_feats, device=self._device)
         confidences = probs[0].tolist()
 
         costs = []

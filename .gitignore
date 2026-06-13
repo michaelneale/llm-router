@@ -1,3 +1,4 @@
+# --- Python ---
 __pycache__/
 *.pyc
 *.pyo
@@ -14,24 +15,47 @@ build/
 .ipynb_checkpoints/
 notebooks/.ipynb_checkpoints/
 
-*.db
-router_telemetry.db
-
+# --- Environments ---
 .env
 .venv/
 venv/
 
-data/*.csv
-data/*/
+# --- Databases & telemetry ---
+*.db
+router_telemetry.db
 
+# --- Logs & caches ---
 cache/
-
 logs/
+*.log
 
+# --- OS ---
 .DS_Store
 
+# --- Agent scratch files ---
 CLAUDE.md
 AGENTS.md
 skills/
-
 working/
+
+# ---------------------------------------------------------------------------
+# Project-specific: keep the *recipe*, not the private inputs/outputs.
+#
+# We share the code, configs, and scripts that let someone build their OWN
+# personalized router from their OWN goose sessions. We do NOT ship:
+#   - training data derived from private session history (prompts, file paths,
+#     repo names, anything you actually typed to goose)
+#   - large trained checkpoints (binary weights; 15-21 MB each)
+# ---------------------------------------------------------------------------
+
+# Training/eval data derived from personal goose session history.
+# Contains real prompts, paths, repo & PR references — do not publish.
+data/
+
+# Trained router checkpoints (large binaries; personal/benchmark-specific).
+# Regenerate with `model-router train` or distribute out-of-band (see README).
+checkpoints/*.pt
+
+# Generated LiteLLM config (derived from goose-mix.yaml via config_bridge).
+# Regenerate with `model-router generate-litellm-config`; uncomment to ignore.
+# configs/litellm-goose.yaml
