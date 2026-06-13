@@ -13,6 +13,130 @@ The core insight: lightweight models can handle a substantial set of queries cor
 
 > **Branch: v3-prefill** — This branch contains LLM Router v3, a prefill complexity-based routing system that learns which models handle which queries well and routes each request to the most efficient model that meets your accuracy threshold. For the intent/multimodal router (v2), see the [experimental](../../tree/experimental) branch. For the original BERT-based router (v1), see [main](../../tree/main).
 
+---
+
+## Fork addendum: a *personalized* router for your own agent (goose)
+
+> This fork extends the NVIDIA blueprint with one idea: **instead of training the
+> router on generic benchmarks, train it on _your own_ assistant transcripts** —
+> the actual prompts you type to a coding agent like [goose](https://github.com/block/goose).
+> The router then learns which of *your* requests genuinely need a frontier model
+> and which a cheap model handles fine, and routes accordingly behind an
+> OpenAI-compatible proxy. It also ships a **live savings dashboard** so you can
+> watch the cost reduction in real time as you work.
+
+![LLM Router live savings dashboard](docs/img/savings-dashboard.png)
+
+*The `/dashboard` endpoint: real-time % saved vs. a frontier baseline, routing
+distribution across tiers, and a resettable counter — populated from your actual
+streaming sessions.*
+
+### Why personalize?
+
+The upstream blueprint assumes you collect labels over benchmark-style questions
+(MMLU, math, coding tasks judged by majority vote or ground-truth answers). That
+produces a router calibrated for *textbook* difficulty. But your real traffic
+doesn't look like a benchmark — it looks like *"list files here"*, *"any open PRs
+from alex?"*, *"never force push, why would you do that"*. A router trained on
+**your** distribution learns that most of that routes safely to a small model,
+while reserving the top tier for the genuinely hard turns. In practice this fork
+routes a real mix across tiers and reports **>90% cost savings** versus sending
+everything to the frontier model.
+
+### Train it for yourself
+
+You build your own checkpoint from your own agent history — no shared weights
+required (see [Pretrained weights](#pretrained-weights) below for why).
+
+```bash
+# 0. Install (see Getting Started) and activate the venv
+pip install -e '.[proxy]'
+
+# 1. Extract genuine prompts from your goose session history.
+#    Reads ~/.local/share/goose/sessions/sessions.db, drops slash-commands,
+#    compaction summaries, synthetic turns, near-duplicates; tags continuations.
+python scripts/extract_goose_questions.py --out data/goose-questions.txt
+
+# 2. Label them: send each question to every model in the pool and record
+#    which models answer acceptably (majority-vote judging needs no ground truth).
+model-router collect \
+  --questions data/goose-questions.txt \
+  --pool-config configs/goose-mix.yaml \
+  --out data/goose-collected.csv
+
+# 3. Train the prefill router (encoder hidden states -> PCA -> MLP per model).
+model-router train \
+  --data data/goose-collected.csv \
+  --pool-config configs/goose-mix.yaml \
+  --out checkpoints/prefill_router_goose.pt
+
+# 4. (optional) Re-price the checkpoint's pool to match current provider costs.
+python scripts/patch_checkpoint_costs.py \
+  checkpoints/prefill_router_goose.pt configs/goose-mix.yaml
+```
+
+`configs/goose-mix.yaml` is the example pool used here — a tiered mix of
+OpenAI/Anthropic models (cheap `gpt-*-nano` tiers up to a frontier
+Claude Opus baseline). Edit it to match the models and prices you actually have
+keys for; model **costs** drive the routing economics and the savings math.
+
+### Use it from goose (or any OpenAI client)
+
+```bash
+# Generate the LiteLLM proxy config from your pool, then serve.
+model-router generate-litellm-config \
+  --pool-config configs/goose-mix.yaml \
+  --out configs/litellm-goose.yaml
+
+# Start the proxy + dashboard. The helper pulls API keys from the macOS
+# keychain at runtime (nothing is hardcoded) and runs the routing encoder on
+# the GPU (ROUTER_DEVICE=mps) — ~0.1-0.4s/route vs ~9s on CPU.
+./scripts/run-goose-proxy.sh
+```
+
+This exposes an OpenAI-compatible endpoint plus three extra routes:
+
+| Endpoint | Purpose |
+|---|---|
+| `POST /v1/chat/completions` | OpenAI-compatible — point goose / any client here |
+| `GET  /dashboard` | live savings web page (auto-refreshes every 3s) |
+| `GET  /savings` | the same data as JSON, for scripting |
+| `POST /savings/reset` | zero the counters for a clean read |
+
+Point the vanilla goose CLI at it with a custom provider (`base_url`
+`http://localhost:4000/v1`), then leave `/dashboard` open in a tab and watch the
+savings climb as you work. Streaming requests are counted too — the proxy forces
+`stream_options.include_usage` and taps the SSE stream to capture real token
+usage without breaking interactive streaming.
+
+### Pretrained weights
+
+**This fork intentionally does not ship a trained `.pt` checkpoint, by design:**
+
+1. **Privacy** — the weights are learned from personal assistant transcripts. They
+   encode decision boundaries derived from real prompts, file paths, and repo/PR
+   references. Sharing the artifact leaks more about the author's workload than it
+   helps you.
+2. **It wouldn't generalize** — a checkpoint trained on one person's coding-agent
+   traffic will route *your* (e.g. legal, creative, support) traffic badly. The
+   value here is the **method**, not the artifact. Building your own takes minutes.
+
+If you want to distribute a checkpoint anyway, do it **out-of-band** rather than in
+git history: a Hugging Face model repo (with a model card noting the training
+source) or a GitHub Release asset are both clean options. `data/` and
+`checkpoints/*.pt` are `.gitignore`d here for exactly these reasons.
+
+### What this fork added on top of the blueprint
+
+- `scripts/extract_goose_questions.py` — mine your goose `sessions.db` into clean training prompts.
+- `configs/goose-mix.yaml` — example tiered OpenAI/Anthropic pool with per-model costs.
+- `scripts/run-goose-proxy.sh` — one-command proxy launch; keychain key injection; GPU routing.
+- Live **savings tracking**: `adapters/litellm/savings.py` + `dashboard.py`, wired into the proxy (`/dashboard`, `/savings`, `/savings/reset`), with **streaming (SSE) usage capture** so interactive agent sessions are counted accurately.
+- `prefill/scorer.py` + `extract.py` — routing encoder device is now configurable via `ROUTER_DEVICE` (e.g. `mps` on Apple Silicon) instead of hardcoded CPU.
+- Helper scripts: `bench_routing.py` (offline routing distribution), `collect_fast.py`, `patch_checkpoint_costs.py`, `tolerance_curve.py`.
+
+---
+
 ### How This Branch Differs
 
 | Feature | v1 (main) | v2 (experimental) | **v3-prefill (this branch)** |
