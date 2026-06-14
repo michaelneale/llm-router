@@ -107,22 +107,28 @@ GOOSE_PROVIDER=litellm GOOSE_MODEL=nvidia-routed \
 goose
 ```
 
-### Run the verified-label (SWE-bench) router
+### Run the verified-label router (recommended)
 
-The checkpoint trained on verified multi-model success (see `docs/LAB_NOTE.md`)
-routes well on coding tasks. Serve it with its own pool:
+Trained on verified multi-model success across the full difficulty range —
+RouterBench (general Q&A), SWE-bench (coding), terminal-bench (ops). See
+`docs/LAB_NOTE.md`. On held-out tasks it matches frontier quality at lower cost
+and routes by difficulty (easy→cheap, hard→top).
 
 ```bash
 ROUTER_DEVICE=mps model-router proxy \
-  --router-config configs/swebench-pool.yaml \
-  --litellm-config configs/litellm-swebench.yaml \
+  --router-config configs/combined-pool.yaml \
+  --litellm-config configs/litellm-combined.yaml \
   --port 4000
 # then point goose at it exactly as above (GOOSE_MODEL=nvidia-routed)
 ```
 
-Note: this checkpoint learned from SWE-bench code-fixing tasks, so it routes best
-on coding work. A router personalized to your own traffic needs verifiable
-success labels from your own sessions — the open next step in the lab note.
+The checkpoint (`checkpoints/prefill_router_combined.pt`) is gitignored;
+regenerate with `scripts/pull_*` + `scripts/build_full_training.py` then
+`model-router train --config configs/combined-pool.yaml --data data/full-train.csv`.
+
+A `configs/swebench-pool.yaml` (coding-only) is also included for comparison.
+Personalizing to your own traffic needs verifiable success labels from your own
+sessions — the open next step in the lab note.
 
 ### Endpoints
 
