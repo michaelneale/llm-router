@@ -77,6 +77,43 @@ success rate at ~1/8th the cost**, and escalates only the genuinely hard tasks
 (18%→3% to top tier as tolerance tightens). That is the whole thesis,
 demonstrated — and it only became possible with a verifiable label.
 
+## Making it useful, not a toy: full-spectrum training
+
+The SWE-bench-only checkpoint routes well on coding but has a blind spot: trained
+only on hard benchmark tasks, it assumes cheap models fail *everything* — so it
+over-routes trivial prompts ("what does ls do") to the top tier. The router only
+knows the difficulty distribution of its training data.
+
+Fix: train across the full difficulty range by combining three verified
+multi-model sources, each mapped onto the 8 pool slots by capability tier:
+
+- **RouterBench** (`withmartian/routerbench`) — 8k+ general Q&A (MMLU, GSM8K,
+  hellaswag, MBPP, …) with per-model correctness. Supplies the *easy* end.
+- **SWE-bench Verified** (`tarsur385/...`) — code-fixing, verified `resolved`.
+- **terminal-bench** (`yoonholee/...` trajectories + `harborframework/...`
+  instructions) — command-line / ops tasks, verified `reward`.
+
+Result: ~70k labeled rows over ~8.7k unique tasks, slot success gradient
+28%→77%. Calibration is fixed — the router now sends "capital of France" to a
+cheap model and a Django ORM bug to the top tier.
+
+Held-out (874 unseen tasks across the full spectrum):
+
+| strategy           | resolved % | avg $/M |
+|--------------------|-----------:|--------:|
+| router @ tol=0.05  |    76.2%   |   18.2  |
+| router @ tol=0.10  |    72.0%   |   12.8  |
+| always mid         |    58.6%   |    2.0  |
+| always Sonnet      |    66.2%   |   15.0  |
+| always Opus (top)  |    76.9%   |   25.0  |
+| oracle             |    91.5%   |    —    |
+
+The router matches frontier quality at lower cost and beats every cheaper fixed
+model, while routing sensibly across easy and hard. On a broad mix the savings
+are more modest than coding-only (RouterBench's hard MMLU/GSM genuinely needs
+strong models), but it is a real, general-purpose router — not a single-benchmark
+demo.
+
 ## Takeaways
 
 - The label is everything. Architecture and tolerance tuning are secondary.

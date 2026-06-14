@@ -65,3 +65,7 @@ data/swebench-train*.csv
 data_public/
 checkpoints/*.pt
 checkpoints/split/
+data/combined-train*.csv
+data/full-train*.csv
+checkpoints/combined*/
+checkpoints/full*/
