@@ -107,6 +107,23 @@ GOOSE_PROVIDER=litellm GOOSE_MODEL=nvidia-routed \
 goose
 ```
 
+### Run the verified-label (SWE-bench) router
+
+The checkpoint trained on verified multi-model success (see `docs/LAB_NOTE.md`)
+routes well on coding tasks. Serve it with its own pool:
+
+```bash
+ROUTER_DEVICE=mps model-router proxy \
+  --router-config configs/swebench-pool.yaml \
+  --litellm-config configs/litellm-swebench.yaml \
+  --port 4000
+# then point goose at it exactly as above (GOOSE_MODEL=nvidia-routed)
+```
+
+Note: this checkpoint learned from SWE-bench code-fixing tasks, so it routes best
+on coding work. A router personalized to your own traffic needs verifiable
+success labels from your own sessions — the open next step in the lab note.
+
 ### Endpoints
 
 | Endpoint | Purpose |
