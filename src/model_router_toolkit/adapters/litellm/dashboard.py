@@ -108,8 +108,8 @@ DASHBOARD_HTML = """<!doctype html>
   </section>
 
   <div class="baseline">
-    Auto-refreshes every 3s. Streaming requests are not counted (no usage block),
-    so interactive goose turns may undercount.
+    Auto-refreshes every 3s. Streaming and non-streaming requests are both counted.
+    Tracks cost, not answer quality.
   </div>
 
 <script>

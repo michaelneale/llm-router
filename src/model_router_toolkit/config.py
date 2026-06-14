@@ -39,8 +39,37 @@ class RoutingConfig(BaseModel):
     encoder_backend: str = "transformers"
 
 
+class EscalationConfig(BaseModel):
+    """Policy overlay: force the top tier for tasks the prefill encoder can't
+    judge (sustained agentic loops, explicit high-stakes). Matched against the
+    user prompt text before the learned router scores it.
+    """
+
+    force_top_tier_when_prompt_matches: list[str] = Field(default_factory=list)
+    top_tier_model: str = ""
+
+
+class DepthToleranceConfig(BaseModel):
+    """Scale routing tolerance by session depth. Trace analysis shows completeness
+    failures cluster DEEP in sessions (21+ tool calls / turn 11+), not early — the
+    model loses the thread as context fills. So tighten tolerance (demand a closer
+    quality match -> escalate) as the conversation deepens. Depth is read from the
+    incoming message list (assistant + tool turns); no retrain, no core change.
+
+    effective_tolerance = base - (base - min_tolerance) * min(1, depth / depth_full)
+    Disabled by default; opt in with enabled: true.
+    """
+
+    enabled: bool = False
+    min_tolerance: float = 0.0  # tolerance at/after depth_full (most escalation)
+    depth_full: int = 30  # tool/assistant turns at which min_tolerance is reached
+    depth_metric: str = "turns"  # "turns" (assistant msgs) or "tools" (tool msgs)
+
+
 class PoolConfig(BaseModel):
     routing: RoutingConfig = Field(default_factory=RoutingConfig)
+    escalation: EscalationConfig = Field(default_factory=EscalationConfig)
+    depth_tolerance: DepthToleranceConfig = Field(default_factory=DepthToleranceConfig)
     models: list[ModelSpec] = Field(default_factory=list)
 
     @property

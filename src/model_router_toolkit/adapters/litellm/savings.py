@@ -48,6 +48,18 @@ class SavingsTracker:
         # rate cache: model_name -> (in_per_m, out_per_m), filled from RoutingResult
         self._rates: dict[str, tuple[float, float]] = {}
         self._baseline_name: str | None = None
+        # slot name -> real model label (e.g. "gpt-oss-120b-high" -> "openai/gpt-5-mini")
+        self._display: dict[str, str] = {}
+
+    def set_display_names(self, mapping: dict[str, str]) -> None:
+        """Map internal checkpoint slot names to the real model they call, so the
+        dashboard shows e.g. 'openai/gpt-5-mini' not the cosmetic 'gpt-oss-120b-high'."""
+        self._display.update({k: v for k, v in mapping.items() if v})
+
+    def _label(self, slot: str | None) -> str | None:
+        if slot is None:
+            return None
+        return self._display.get(slot, slot)
 
     def _ingest_rates(self, result) -> None:
         """Capture per-model token rates from a RoutingResult (once is enough,
@@ -117,7 +129,7 @@ class SavingsTracker:
             saved = t.baseline_cost - t.actual_cost
             pct = (saved / t.baseline_cost * 100) if t.baseline_cost else 0.0
             dist = {
-                m: {
+                self._label(m): {
                     "requests": n,
                     "share_pct": round(n / t.requests * 100, 1) if t.requests else 0.0,
                     "actual_cost_usd": round(t.per_model_actual[m], 6),
@@ -130,7 +142,7 @@ class SavingsTracker:
             }
             return {
                 "uptime_seconds": round(time.time() - self._started, 1),
-                "baseline_model": self._baseline_name,
+                "baseline_model": self._label(self._baseline_name),
                 "requests": t.requests,
                 "input_tokens": t.input_tokens,
                 "output_tokens": t.output_tokens,

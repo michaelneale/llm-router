@@ -80,34 +80,62 @@ OpenAI/Anthropic models (cheap `gpt-*-nano` tiers up to a frontier
 Claude Opus baseline). Edit it to match the models and prices you actually have
 keys for; model **costs** drive the routing economics and the savings math.
 
-### Use it from goose (or any OpenAI client)
+### Run the proxy
 
 ```bash
-# Generate the LiteLLM proxy config from your pool, then serve.
-model-router generate-litellm-config \
-  --pool-config configs/goose-mix.yaml \
-  --out configs/litellm-goose.yaml
+# Start proxy + dashboard on :4000. Reads OPENAI_API_KEY/ANTHROPIC_API_KEY from
+# the env, or falls back to the macOS "goose" keychain entry. Picks mps on Apple
+# Silicon (~0.1-0.4s/route) else cpu (~9s/route).
+./scripts/run.sh
 
-# Start the proxy + dashboard. The helper pulls API keys from the macOS
-# keychain at runtime (nothing is hardcoded) and runs the routing encoder on
-# the GPU (ROUTER_DEVICE=mps) — ~0.1-0.4s/route vs ~9s on CPU.
-./scripts/run-goose-proxy.sh
+# Override port:
+PORT=4100 ./scripts/run.sh
+
+# By hand (no helper):
+model-router proxy-config --config configs/goose-mix.yaml --output configs/litellm-goose.yaml
+ROUTER_DEVICE=mps model-router proxy \
+  --router-config configs/goose-mix.yaml \
+  --litellm-config configs/litellm-goose.yaml \
+  --port 4000
 ```
 
-This exposes an OpenAI-compatible endpoint plus three extra routes:
+### Point goose at it
+
+```bash
+LITELLM_HOST=http://localhost:4000 LITELLM_API_KEY=sk-local \
+GOOSE_PROVIDER=litellm GOOSE_MODEL=nvidia-routed \
+goose
+```
+
+### Endpoints
 
 | Endpoint | Purpose |
 |---|---|
 | `POST /v1/chat/completions` | OpenAI-compatible — point goose / any client here |
 | `GET  /dashboard` | live savings web page (auto-refreshes every 3s) |
-| `GET  /savings` | the same data as JSON, for scripting |
-| `POST /savings/reset` | zero the counters for a clean read |
+| `GET  /savings` | same data as JSON |
+| `POST /savings/reset` | zero the counters |
 
-Point the vanilla goose CLI at it with a custom provider (`base_url`
-`http://localhost:4000/v1`), then leave `/dashboard` open in a tab and watch the
-savings climb as you work. Streaming requests are counted too — the proxy forces
-`stream_options.include_usage` and taps the SSE stream to capture real token
-usage without breaking interactive streaming.
+Streaming is counted (the proxy forces `stream_options.include_usage` and taps
+the SSE stream). The dashboard tracks **cost, not answer quality**.
+
+### Routed vs frontier: a real task
+
+Same task (upgrade `iroh` rc.0 → rc.1 in a Rust workspace, fix API breaks,
+validate), same repo context (`AGENTS.md` + skills), once routed (→ gpt-5-mini)
+and once direct to Opus 4.8.
+
+- **Code: a tie.** Both produced a correct migration and the same three API-break
+  fixes.
+- **Follow-through: Opus won.** The repo's `AGENTS.md` documents a validation
+  procedure (build, clippy, multi-node + public-mesh tests). Opus read it and
+  ran it end-to-end (built, tested 4/4 relay tests, joined the public mesh, ran a
+  live inference round-trip). The routed model read the same file, built locally,
+  then handed the validation back as a "recommendation."
+
+The savings number can't see this: per-turn coding quality rarely needs a
+frontier model, but **agentic completeness** (sustaining a long task to done)
+does, and a cost dashboard won't show the difference.
 
 ### Pretrained weights
 

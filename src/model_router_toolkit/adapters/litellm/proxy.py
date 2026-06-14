@@ -113,6 +113,19 @@ def start_proxy(
     )
 
     tracker = get_tracker()
+    # Map internal checkpoint slot names -> the real model they call, so the
+    # dashboard shows "openai/gpt-5-mini" instead of the cosmetic NVIDIA slot
+    # name "gpt-oss-120b-high".
+    try:
+        from model_router_toolkit.config import load_config
+
+        _pool = load_config(router_config_abs)
+        tracker.set_display_names(
+            {m.name: (m.litellm_model or m.display_name or m.name) for m in _pool.models}
+        )
+    except Exception as e:  # pragma: no cover - display sugar only
+        logger.warning("Could not load display names for dashboard: %s", e)
+
     _strategy_ref = None
 
     # litellm >= ~1.60 uses a lifespan context; legacy @app.on_event("startup")

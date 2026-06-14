@@ -59,3 +59,9 @@ checkpoints/*.pt
 # Generated LiteLLM config (derived from goose-mix.yaml via config_bridge).
 # Regenerate with `model-router generate-litellm-config`; uncomment to ignore.
 # configs/litellm-goose.yaml
+
+# SWE-bench training data + cache (large, regenerable via scripts/pull_swebench_traces.py)
+data/swebench-train*.csv
+data_public/
+checkpoints/*.pt
+checkpoints/split/

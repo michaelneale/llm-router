@@ -43,12 +43,26 @@ class ModelRoutingStrategy:
         *,
         tolerance: float = 0.20,
         models: list[str] | None = None,
+        escalation_patterns: list[str] | None = None,
+        escalation_model: str = "",
+        depth_tolerance: Any = None,
     ):
+        import re as _re
+
         self._router = router
         self._tolerance = tolerance
         self._models = models
         self._litellm_router: Any = None
         self._last_result: RoutingResult | None = None
+        # Depth-scaled tolerance: tighten tolerance (-> escalate) as the session
+        # deepens, because completeness failures cluster deep, not early.
+        self._depth_tol = depth_tolerance
+        # Policy escalation overlay: force the top tier when the prompt matches
+        # (sustained agentic loops the prefill encoder can't see, or !hard).
+        self._escalation_model = escalation_model
+        self._escalation_res = [
+            _re.compile(p, _re.IGNORECASE) for p in (escalation_patterns or [])
+        ]
 
     @classmethod
     def from_config(cls, config_path: str, **kwargs: Any) -> ModelRoutingStrategy:
@@ -57,7 +71,46 @@ class ModelRoutingStrategy:
 
         config = load_config(config_path)
         router = build_router_from_config(config)
+        esc = config.escalation
+        kwargs.setdefault("escalation_patterns", esc.force_top_tier_when_prompt_matches)
+        kwargs.setdefault("escalation_model", esc.top_tier_model)
+        kwargs.setdefault("depth_tolerance", config.depth_tolerance)
         return cls(router, tolerance=config.routing.tolerance, **kwargs)
+
+    def _escalates(self, text: str) -> bool:
+        return bool(self._escalation_model) and any(
+            r.search(text) for r in self._escalation_res
+        )
+
+    def _session_depth(self, messages: list[dict] | None) -> int:
+        """Estimate how deep the session is from the incoming message list.
+
+        'turns' = number of assistant messages so far; 'tools' = number of
+        tool/function messages (proxy for tool-call depth)."""
+        if not messages:
+            return 0
+        metric = getattr(self._depth_tol, "depth_metric", "turns")
+        if metric == "tools":
+            return sum(
+                1
+                for m in messages
+                if m.get("role") == "tool" or m.get("tool_calls") or m.get("tool_call_id")
+            )
+        return sum(1 for m in messages if m.get("role") == "assistant")
+
+    def _depth_scaled_tolerance(self, base: float, messages: list[dict] | None) -> float:
+        """Tighten tolerance toward min_tolerance as session depth grows."""
+        dt = self._depth_tol
+        if not dt or not getattr(dt, "enabled", False):
+            return base
+        depth = self._session_depth(messages)
+        full = max(1, getattr(dt, "depth_full", 30))
+        frac = min(1.0, depth / full)
+        # Floor at 0.001 (never exactly 0): at tol=0 the cost term drops out and
+        # routing becomes incoherent — trivial deep turns ratchet to the top tier.
+        floor = max(0.001, getattr(dt, "min_tolerance", 0.0))
+        scaled = base - (base - floor) * frac
+        return max(floor, min(1.0, scaled))
 
     @property
     def tolerance(self) -> float:
@@ -146,11 +199,30 @@ class ModelRoutingStrategy:
                 return self._litellm_router.model_list[0]
             return {}
 
+        # Policy escalation: sustained-loop / high-stakes prompts that look easy
+        # per-turn but need the top tier for the whole task. Imposed by rule, not
+        # learned — see docs/ROUTING_FINDINGS.md (the "poll CI until done" case).
+        if self._escalates(text):
+            from model_router_toolkit.router import RoutingResult as _RR
+
+            dep = self._find_deployment(self._escalation_model)
+            if dep:
+                self._last_result = _RR(
+                    model_names=[self._escalation_model],
+                    confidences=[1.0],
+                    costs=[],
+                    selected_model=self._escalation_model,
+                    metadata={"escalated": True},
+                )
+                logger.info("Escalation policy -> %s", self._escalation_model)
+                return dep
+
         req_models = ((request_kwargs or {}).get("metadata") or {}).get("models")
         allowed = req_models or self._models
+        tol = self._depth_scaled_tolerance(self.effective_tolerance, messages)
         result = self._router.route(
             text,
-            tolerance=self.effective_tolerance,
+            tolerance=tol,
             models=allowed,
         )
         self._last_result = result

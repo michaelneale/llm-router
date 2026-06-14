@@ -117,6 +117,8 @@ def _call_model(
     system_prompt: str = "",
     **kwargs,
 ) -> tuple[str, int]:
+    import os
+
     import litellm
 
     messages = []
@@ -124,7 +126,16 @@ def _call_model(
         messages.append({"role": "system", "content": system_prompt})
     messages.append({"role": "user", "content": question})
 
-    response = litellm.completion(model=litellm_model, messages=messages, **kwargs)
+    # Robustness for batch collection: without a per-call timeout one slow
+    # reasoning model on a deep-context prompt stalls the entire run, and
+    # without a token cap a single answer can run away. Both env-tunable.
+    timeout = float(os.environ.get("ROUTER_COLLECT_TIMEOUT", "90"))
+    max_toks = int(os.environ.get("ROUTER_COLLECT_MAX_TOKENS", "1024"))
+    call_kwargs = {"timeout": timeout, "max_tokens": max_toks, **kwargs}
+
+    response = litellm.completion(
+        model=litellm_model, messages=messages, **call_kwargs
+    )
     content = response.choices[0].message.content or ""
     usage = response.usage
     output_tokens = getattr(usage, "completion_tokens", 0) or 0
@@ -178,25 +189,38 @@ def run_collect(
     model_correct: dict[str, int] = {}
     model_total: dict[str, int] = {}
 
+    # The N model calls for a single question are independent, so fan them out
+    # in parallel — collection is network-bound and this is the dominant cost.
+    # Tunable via ROUTER_COLLECT_CONCURRENCY (default = number of models).
+    import os
+    from concurrent.futures import ThreadPoolExecutor
+
+    _concurrency = int(
+        os.environ.get("ROUTER_COLLECT_CONCURRENCY", str(len(config.models)))
+    )
+
+    def _one(model_spec, q):
+        try:
+            return model_spec.name, _call_model(
+                model_spec.litellm_model,
+                q,
+                system_prompt=model_spec.system_prompt or "",
+                **model_spec.chat_template_kwargs,
+            )
+        except Exception:
+            logger.warning(
+                "Model %s failed on question: %.80s...",
+                model_spec.name,
+                q,
+                exc_info=True,
+            )
+            return model_spec.name, ("", 0)
+
     for q in iterator:
         outputs_by_model: dict[str, tuple[str, int]] = {}
-        for model_spec in config.models:
-            try:
-                content, out_tokens = _call_model(
-                    model_spec.litellm_model,
-                    q,
-                    system_prompt=model_spec.system_prompt or "",
-                    **model_spec.chat_template_kwargs,
-                )
-                outputs_by_model[model_spec.name] = (content, out_tokens)
-            except Exception:
-                logger.warning(
-                    "Model %s failed on question: %.80s...",
-                    model_spec.name,
-                    q,
-                    exc_info=True,
-                )
-                outputs_by_model[model_spec.name] = ("", 0)
+        with ThreadPoolExecutor(max_workers=_concurrency) as ex:
+            for name, result in ex.map(lambda ms: _one(ms, q), config.models):
+                outputs_by_model[name] = result
 
         if judge_method == "vote":
             all_outputs = [o for o, _ in outputs_by_model.values()]
@@ -209,6 +233,7 @@ def run_collect(
                         "model": model_name,
                         "isCorrect": int(is_correct),
                         "output_tokens": out_tokens,
+                        "output_excerpt": (content or "")[:600],
                     }
                 )
                 model_total[model_name] = model_total.get(model_name, 0) + 1
@@ -224,6 +249,7 @@ def run_collect(
                         "model": model_name,
                         "isCorrect": int(is_correct),
                         "output_tokens": out_tokens,
+                        "output_excerpt": (content or "")[:600],
                     }
                 )
                 model_total[model_name] = model_total.get(model_name, 0) + 1
@@ -248,6 +274,7 @@ def run_collect(
                         "model": model_name,
                         "isCorrect": int(is_correct),
                         "output_tokens": out_tokens,
+                        "output_excerpt": (content or "")[:600],
                     }
                 )
                 model_total[model_name] = model_total.get(model_name, 0) + 1
@@ -257,7 +284,7 @@ def run_collect(
     with open(output_path, "w", newline="") as f:
         writer = csv.DictWriter(
             f,
-            fieldnames=["question", "model", "isCorrect", "output_tokens"],
+            fieldnames=["question", "model", "isCorrect", "output_tokens", "output_excerpt"],
         )
         writer.writeheader()
         writer.writerows(rows)

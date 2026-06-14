@@ -1,11 +1,25 @@
 # Goose mix: checkpoint slot names (must match training) -> OpenAI/Anthropic models.
-# Top tier = claude-opus-4-6 (Fable 5 stand-in; swap litellm_model when databricks auth works).
+# Top tier = claude-opus-4-8 (Fable 5 stand-in). `name` fields are checkpoint
+# slots and must match the trained model; only costs/tolerance/escalation tune it.
 routing:
   method: prefill
   checkpoint: checkpoints/prefill_router_goose.pt
-  tolerance: 0.05
+  tolerance: 0.03
   encoder: Qwen/Qwen3.5-0.8B
   encoder_backend: transformers
+
+# Force the top tier for tasks the prefill encoder can't judge: sustained agentic
+# loops and explicit high-stakes requests. Rare (~1-2% of traffic) but where cheap
+# models fail the whole session even when each turn looks easy. See
+# docs/ROUTING_FINDINGS.md. Imposed by policy, not learned.
+# Experimental (default OFF). Keyword overlay that forces the top tier for
+# sustained-loop prompts the per-turn encoder can't see. A hand-written rule, not
+# learned — kept as an opt-in safety net, not the recommended approach. The right
+# fix is verified-label training (docs/LAB_NOTE.md). Add patterns + a top_tier_model
+# to enable.
+escalation:
+  force_top_tier_when_prompt_matches: []
+  top_tier_model: ""
 
 models:
   - name: nemotron-3-nano-reasoning
@@ -61,3 +75,16 @@ models:
     litellm_model: anthropic/claude-opus-4-8
     cost_per_m_input_tokens: 5.00
     cost_per_m_output_tokens: 25.00
+
+# Tighten tolerance as the session deepens (failures cluster deep, not early).
+# turn 0 routes at base tolerance; by depth_full assistant turns it reaches
+# min_tolerance (max escalation). See docs/ROUTING_FINDINGS.md.
+# Experimental (default OFF). Tightens tolerance as a session deepens. Tested:
+# works mechanically but barely moves routing within the safe band (min_tolerance
+# must stay >0 or it ratchets cost wastefully). The real lever is the training
+# label, not this knob — see docs/LAB_NOTE.md. Left as opt-in for experiments.
+depth_tolerance:
+  enabled: false
+  min_tolerance: 0.005   # never 0.0 (zero tolerance routes trivial turns to top tier)
+  depth_full: 30
+  depth_metric: turns
