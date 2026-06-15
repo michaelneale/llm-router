@@ -107,17 +107,21 @@ class PrefillScorer:
         cost_table = self._ckpt.get("cost_table", {})
         for mname in self.model_names:
             ct = cost_table.get(mname, {})
-
-            pool_targets = self._ckpt.get("pool_config", {})
-            if isinstance(pool_targets, dict):
-                pool_targets = pool_targets.get("targets", [])
             rate_in = 0.0
             rate_out = 0.0
-            for pt in pool_targets:
-                if isinstance(pt, dict) and pt.get("name") == mname:
-                    rate_in = pt.get("cost_per_m_input_tokens", 0.0)
-                    rate_out = pt.get("cost_per_m_output_tokens", 0.0)
-                    break
+            spec = self._config.get_model(mname) if self._config is not None else None
+            if spec is not None:
+                rate_in = spec.cost_per_m_input_tokens
+                rate_out = spec.cost_per_m_output_tokens
+            else:
+                pool_targets = self._ckpt.get("pool_config", {})
+                if isinstance(pool_targets, dict):
+                    pool_targets = pool_targets.get("targets", [])
+                for pt in pool_targets:
+                    if isinstance(pt, dict) and pt.get("name") == mname:
+                        rate_in = pt.get("cost_per_m_input_tokens", 0.0)
+                        rate_out = pt.get("cost_per_m_output_tokens", 0.0)
+                        break
 
             median_out = int(ct.get("median_output_tokens", 500))
             est_in_tokens = len(question.split()) * 2

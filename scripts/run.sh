@@ -17,6 +17,8 @@ cd "$(dirname "$0")/.."
 POOL="${POOL:-configs/goose-mix.yaml}"
 LITELLM="${LITELLM:-configs/litellm-goose.yaml}"
 PORT="${PORT:-4000}"
+ROUTER_ROUTE_LOG="${ROUTER_ROUTE_LOG:-/tmp/router-routes.jsonl}"
+export ROUTER_ROUTE_LOG
 
 # --- API keys: env first, then macOS keychain ---
 if [[ -z "${OPENAI_API_KEY:-}" || -z "${ANTHROPIC_API_KEY:-}" ]]; then
@@ -33,6 +35,17 @@ if [[ -z "${OPENAI_API_KEY:-}" && -z "${ANTHROPIC_API_KEY:-}" ]]; then
   echo "      Set the keys your pool ($POOL) needs, or the upstream calls will fail." >&2
 fi
 
+# Agents often point OpenAI-compatible clients at this proxy by exporting
+# OPENAI_BASE_URL=http://localhost:$PORT/v1. Do not let the proxy inherit that
+# as its upstream OpenAI base, or routed OpenAI calls recurse back into itself.
+if [[ "${ROUTER_PRESERVE_OPENAI_BASE_URL:-0}" != "1" ]]; then
+  case "${OPENAI_BASE_URL:-}${OPENAI_API_BASE:-}" in
+    *localhost:$PORT*|*127.0.0.1:$PORT*)
+      unset OPENAI_BASE_URL OPENAI_API_BASE
+      ;;
+  esac
+fi
+
 # --- routing device: detect Apple Silicon -> mps, else cpu ---
 if [[ -z "${ROUTER_DEVICE:-}" ]]; then
   if [[ "$(uname -s)" == "Darwin" && "$(uname -m)" == "arm64" ]]; then
@@ -42,6 +55,7 @@ if [[ -z "${ROUTER_DEVICE:-}" ]]; then
   fi
 fi
 export ROUTER_DEVICE
+export ROUTER_DISABLE_SWITCHING="${ROUTER_DISABLE_SWITCHING:-0}"
 
 # --- ensure the litellm config exists (generate from the pool if missing) ---
 BIN=".venv/bin/model-router"
@@ -53,6 +67,11 @@ fi
 
 echo "Router device : $ROUTER_DEVICE"
 echo "Pool          : $POOL"
+if [[ -n "${ROUTER_TOLERANCE:-}" ]]; then
+  echo "Tolerance     : $ROUTER_TOLERANCE (env override)"
+fi
+echo "Switching     : $([[ "$ROUTER_DISABLE_SWITCHING" == "1" ]] && echo disabled || echo config)"
+echo "Route log     : $ROUTER_ROUTE_LOG"
 echo "Proxy         : http://localhost:$PORT  (dashboard: /dashboard)"
 
 exec "$BIN" proxy \

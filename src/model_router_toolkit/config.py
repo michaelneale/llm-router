@@ -19,6 +19,7 @@ class ModelSpec(BaseModel):
     litellm_model: str = ""
     cost_per_m_input_tokens: float = 0.0
     cost_per_m_output_tokens: float = 0.0
+    routing_cost_multiplier: float = 1.0
     system_prompt: str = ""
     chat_template_kwargs: dict[str, Any] = Field(default_factory=dict)
     api_base: str = ""
@@ -32,6 +33,7 @@ class RoutingConfig(BaseModel):
     method: str = "prefill"
     checkpoint: str = ""
     tolerance: float = 0.20
+    output_token_weight: float = 0.0
 
     encoder: str = ""
     encoder_server: str = ""
@@ -47,6 +49,18 @@ class EscalationConfig(BaseModel):
 
     force_top_tier_when_prompt_matches: list[str] = Field(default_factory=list)
     top_tier_model: str = ""
+
+
+class UtilityConfig(BaseModel):
+    """Cheap-route overlay for obvious utility prompts.
+
+    These are cold-session prompts where provider quality is not the scarce
+    resource: greetings, title-like niceties, or simple local command/listing
+    requests. Keep patterns narrow; substantive tasks should go through the
+    learned router.
+    """
+
+    cheap_when_prompt_matches: list[str] = Field(default_factory=list)
 
 
 class DepthToleranceConfig(BaseModel):
@@ -98,6 +112,7 @@ class SwitchingConfig(BaseModel):
 class PoolConfig(BaseModel):
     routing: RoutingConfig = Field(default_factory=RoutingConfig)
     escalation: EscalationConfig = Field(default_factory=EscalationConfig)
+    utility: UtilityConfig = Field(default_factory=UtilityConfig)
     depth_tolerance: DepthToleranceConfig = Field(default_factory=DepthToleranceConfig)
     switching: SwitchingConfig = Field(default_factory=SwitchingConfig)
     models: list[ModelSpec] = Field(default_factory=list)

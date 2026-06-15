@@ -1,19 +1,6 @@
-# Verified-trace router pool, remapped for a GPT-5.5 frontier baseline.
-#
-# The checkpoint was trained from public verified multi-model success matrices,
-# then mapped onto the callable Anthropic/OpenAI models below:
-# - RouterBench: broad Q&A / coding / reasoning correctness over many source LLMs.
-# - SWE-bench trajectories: code-fixing tasks with verified resolved labels.
-# - terminal-bench trajectories: terminal / ops tasks with verified reward labels.
-#
-# Important: `name` is the checkpoint slot and must not change without retraining.
-# `display_name` / `litellm_model` are the current provider models we serve in
-# that slot. This aggressive pool uses GPT-5.5 as the only frontier/top
-# escalation slot, caps the high automatic slot at GPT-5.4 Mini, and uses GPT
-# mini/nano variants plus Haiku/Sonnet below that. The current trial tolerance is
-# 0.145: a high-savings local replay point with about 3.9pp public verified-label
-# loss. Use ROUTER_TOLERANCE or scripts/select_router_operating_point.py for
-# sweeps.
+# High-savings experiment: GPT-5.5 remains the only forced frontier tier, while
+# the learned high-but-not-top slot is capped at GPT-5.4 Mini. This is intended
+# for A/B validation, not as proven equivalent quality.
 routing:
   method: prefill
   checkpoint: checkpoints/prefill_router_combined.pt
@@ -22,16 +9,11 @@ routing:
   encoder: Qwen/Qwen3.5-0.8B
   encoder_backend: transformers
 
-# Explicit guardrail: keep the learned router in charge unless the user forces
-# the frontier tier with !hard.
 escalation:
   top_tier_model: claude-opus-4-6-high
   force_top_tier_when_prompt_matches:
     - "(^|\\s)!hard\\b"
 
-# Cold-session utility overlay: route obviously-simple requests to the cheapest
-# callable model instead of spending a classifier high-tier pick. Once a session
-# has an incumbent model, cache-preserving pin/switch logic is allowed to govern.
 utility:
   cheap_when_prompt_matches:
     - "^\\s*(hi|hello|hey|thanks|thank you)\\s*[!.?]*\\s*$"
@@ -39,9 +21,6 @@ utility:
     - "^\\s*(ls|pwd|whoami|date)\\b\\s*$"
     - "^\\s*what\\s+does\\s+(ls|pwd|whoami|date)\\s+do\\??\\s*$"
 
-# Cache-aware asymmetric switching: escalate readily (cheap cache to abandon),
-# resist de-escalating off a warm-cached dearer model — more so the bigger the
-# cached context. Keeps the prompt cache alive on big-context agent sessions.
 switching:
   enabled: true
   up_margin: 0.0

@@ -28,6 +28,21 @@ class PrefillRouter(BaseRouter):
         self._scorer._ensure_loaded()
         self._model_names = self._scorer.model_names
 
+    def _routing_cost_key(self, model_name: str, cost: CostEstimate) -> tuple[float, str]:
+        output_weight = 0.0
+        multiplier = 1.0
+        if self._config is not None:
+            routing = getattr(self._config, "routing", None)
+            output_weight = float(getattr(routing, "output_token_weight", 0.0) or 0.0)
+            spec = self._config.get_model(model_name) if hasattr(self._config, "get_model") else None
+            if spec is not None:
+                multiplier = float(getattr(spec, "routing_cost_multiplier", 1.0) or 1.0)
+        weighted_cost = (
+            cost.cost_per_m_input_tokens
+            + output_weight * cost.cost_per_m_output_tokens
+        ) * multiplier
+        return (weighted_cost, model_name)
+
     def route(
         self,
         question: str,
@@ -52,7 +67,7 @@ class PrefillRouter(BaseRouter):
 
         cost_sorted = sorted(
             zip(raw.model_names, raw.confidences, raw.costs),
-            key=lambda x: x[2].cost_per_m_input_tokens,
+            key=lambda x: self._routing_cost_key(x[0], x[2]),
         )
 
         selected = [n for n, _, _ in cost_sorted if n in allowed][-1]

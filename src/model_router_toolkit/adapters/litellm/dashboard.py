@@ -47,6 +47,28 @@ DASHBOARD_HTML = """<!doctype html>
   .row .pct { width:120px; text-align:right; color:var(--muted); font-size:12px;
               font-variant-numeric:tabular-nums; }
   .baseline { font-size:12px; color:var(--muted); }
+  .knob-grid { display:grid; grid-template-columns:repeat(auto-fit,minmax(190px,1fr));
+               gap:10px; margin-bottom:14px; }
+  .knob { background:#0d1117; border:1px solid var(--line); border-radius:8px;
+          padding:10px 12px; min-height:72px; }
+  .knob .key { color:var(--muted); font-size:11px; text-transform:uppercase;
+               letter-spacing:.04em; }
+  .knob .value { font-size:18px; font-weight:600; margin-top:4px; }
+  .knob .note { color:var(--muted); font-size:12px; margin-top:2px;
+                white-space:nowrap; overflow:hidden; text-overflow:ellipsis; }
+  .pillrow { display:flex; gap:6px; flex-wrap:wrap; margin:4px 0 14px; }
+  .pill { border:1px solid var(--line); border-radius:999px; padding:2px 8px;
+          color:var(--muted); font-size:12px; background:#0d1117; }
+  .pill.on { color:var(--green); border-color:#1f6f3f; }
+  .pill.warn { color:var(--warn); border-color:#8a6a1f; }
+  table { width:100%; border-collapse:collapse; font-size:12px; }
+  th,td { border-top:1px solid var(--line); padding:8px 6px; text-align:left;
+          vertical-align:top; }
+  th { color:var(--muted); font-weight:600; text-transform:uppercase;
+       letter-spacing:.04em; font-size:11px; }
+  td.num { text-align:right; font-variant-numeric:tabular-nums; white-space:nowrap; }
+  .model-name { font-weight:600; }
+  .model-slot { color:var(--muted); font-size:11px; margin-top:1px; }
   button { background:#21262d; color:var(--fg); border:1px solid var(--line);
            border-radius:8px; padding:9px 16px; font-size:13px; cursor:pointer; }
   button:hover { border-color:var(--accent); color:var(--accent); }
@@ -88,10 +110,15 @@ DASHBOARD_HTML = """<!doctype html>
       <div class="val accent" id="requests">—</div>
     </div>
     <div class="card">
-      <div class="label">Tokens (in / out)</div>
+      <div class="label">Tokens (in / cached / out)</div>
       <div class="val" id="tokens" style="font-size:20px">—</div>
     </div>
   </div>
+
+  <section>
+    <h2>Routing knobs</h2>
+    <div id="knobs"><div class="empty">Waiting for router config.</div></div>
+  </section>
 
   <section>
     <h2>Routing distribution</h2>
@@ -116,6 +143,90 @@ DASHBOARD_HTML = """<!doctype html>
 const $ = id => document.getElementById(id);
 function money(n){ return "$" + Number(n).toFixed(Number(n) < 1 ? 4 : 2); }
 function fmt(n){ return Number(n).toLocaleString(); }
+function esc(v){
+  return String(v ?? "").replace(/[&<>"']/g, c => {
+    if(c === "&") return "&amp;";
+    if(c === "<") return "&lt;";
+    if(c === ">") return "&gt;";
+    if(c === '"') return "&quot;";
+    return "&#39;";
+  });
+}
+
+function renderKnobs(k){
+  const box = $("knobs");
+  if(!k || !Object.keys(k).length){
+    box.innerHTML = '<div class="empty">No router config exposed yet.</div>';
+    return;
+  }
+  if(k.error){
+    box.innerHTML = `<div class="empty">${esc(k.error)}</div>`;
+    return;
+  }
+
+  const sw = k.switching || {};
+  const top = k.top_tier || {};
+  const override = k.manual_override || "none";
+  const envTol = k.env_tolerance ? `env ${Number(k.env_tolerance).toFixed(3)}` : "config";
+  const switchState = sw.effective ? "on" : "off";
+  const switchNote = sw.effective
+    ? `up ${Number(sw.up_margin || 0).toFixed(2)} · down ${Number(sw.down_margin || 0).toFixed(2)} + ${Number(sw.down_margin_per_100k || 0).toFixed(2)}/100k`
+    : (sw.disabled_by_env ? "disabled by env" : "disabled in config");
+  const models = Array.isArray(k.models) ? k.models : [];
+  const rows = models.map(m => `
+    <tr>
+      <td>
+        <div class="model-name">${esc(m.display_name || m.slot)}</div>
+        <div class="model-slot">${esc(m.slot)}</div>
+      </td>
+      <td>${esc(m.litellm_model || "")}</td>
+      <td class="num">${Number(m.input_cost || 0).toFixed(2)} / ${Number(m.output_cost || 0).toFixed(2)}</td>
+      <td class="num">${Number(m.routing_blend || 0).toFixed(3)}${Number(m.routing_cost_multiplier || 1) !== 1 ? ` ×${Number(m.routing_cost_multiplier).toFixed(2)}` : ""}</td>
+    </tr>`).join("");
+
+  box.innerHTML = `
+    <div class="knob-grid">
+      <div class="knob">
+        <div class="key">Tolerance</div>
+        <div class="value">${Number(k.effective_tolerance || 0).toFixed(3)}</div>
+        <div class="note">${esc(envTol)}</div>
+      </div>
+      <div class="knob">
+        <div class="key">Cost key</div>
+        <div class="value">in + ${Number(k.output_token_weight || 0).toFixed(2)}×out</div>
+        <div class="note">sorted cheapest first</div>
+      </div>
+      <div class="knob">
+        <div class="key">Switching</div>
+        <div class="value">${esc(switchState)}</div>
+        <div class="note" title="${esc(switchNote)}">${esc(switchNote)}</div>
+      </div>
+      <div class="knob">
+        <div class="key">Top tier</div>
+        <div class="value">${esc(top.display_name || "none")}</div>
+        <div class="note">${esc(top.litellm_model || "")}</div>
+      </div>
+      <div class="knob">
+        <div class="key">Manual top</div>
+        <div class="value">${esc(override)}</div>
+        <div class="note">explicit frontier override</div>
+      </div>
+      <div class="knob">
+        <div class="key">Route log</div>
+        <div class="value">${k.route_log ? "on" : "off"}</div>
+        <div class="note" title="${esc(k.route_log || "")}">${esc(k.route_log || "not configured")}</div>
+      </div>
+    </div>
+    <div class="pillrow">
+      <span class="pill ${sw.effective ? "on" : "warn"}">switching ${esc(switchState)}</span>
+      <span class="pill">pool ${esc((k.pool_config || "").split("/").pop() || "")}</span>
+      <span class="pill">proxy ${esc((k.litellm_config || "").split("/").pop() || "")}</span>
+    </div>
+    <table>
+      <thead><tr><th>Routing ladder</th><th>Provider model</th><th class="num">$/M in / out</th><th class="num">Blend</th></tr></thead>
+      <tbody>${rows || '<tr><td colspan="4" class="muted">No models loaded.</td></tr>'}</tbody>
+    </table>`;
+}
 
 async function load(){
   try {
@@ -127,9 +238,11 @@ async function load(){
     $("actual").textContent = money(d.actual_cost_usd || 0);
     $("baseline").textContent = money(d.baseline_cost_usd || 0);
     $("requests").textContent = fmt(d.requests || 0);
-    $("tokens").textContent = fmt(d.input_tokens||0) + " / " + fmt(d.output_tokens||0);
+    $("tokens").textContent = fmt(d.input_tokens||0) + " / " +
+      fmt(d.cached_input_tokens||0) + " / " + fmt(d.output_tokens||0);
     $("baseline_model").textContent = d.baseline_model || "—";
     $("uptime").textContent = Math.round(d.uptime_seconds||0) + "s";
+    renderKnobs(d.routing_knobs || {});
 
     const dist = d.routing_distribution || {};
     const names = Object.keys(dist);
@@ -138,7 +251,7 @@ async function load(){
     box.innerHTML = names.map(n => {
       const e = dist[n];
       return `<div class="row">
-        <div class="name" title="${n}">${n}</div>
+        <div class="name" title="${esc(n)}">${esc(n)}</div>
         <div class="bar"><div style="width:${e.share_pct}%"></div></div>
         <div class="pct">${e.share_pct}% · ${e.requests} · ${money(e.actual_cost_usd)}</div>
       </div>`;

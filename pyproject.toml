@@ -54,6 +54,10 @@ proxy = [
     "litellm[proxy]>=1.50,<=1.82.6",
     "packaging>=20.0",
 ]
+verified-data = [
+    "pandas>=2.0",
+    "pyarrow>=14.0",
+]
 dev = [
     "pytest>=7.0",
     "pytest-asyncio>=0.21",
@@ -63,7 +67,7 @@ dev = [
     "mypy>=1.0",
 ]
 all = [
-    "model-router-toolkit[prefill,litellm,server,training,proxy,dev]",
+    "model-router-toolkit[prefill,litellm,server,training,proxy,verified-data,dev]",
 ]
 
 [project.scripts]

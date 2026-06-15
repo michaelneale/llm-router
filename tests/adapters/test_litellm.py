@@ -95,6 +95,22 @@ class TestModelRoutingStrategy:
         strategy.tolerance = 1.5
         assert strategy.tolerance == 1.0
 
+    def test_from_config_tolerance_env_override(self, tmp_path, monkeypatch):
+        cfg = tmp_path / "pool.yaml"
+        cfg.write_text(
+            """
+routing:
+  method: prefill
+  tolerance: 0.02
+models: []
+"""
+        )
+        monkeypatch.setenv("ROUTER_TOLERANCE", "0.125")
+
+        strategy = ModelRoutingStrategy.from_config(str(cfg))
+
+        assert strategy.tolerance == 0.125
+
     def test_empty_messages(self):
         strategy = ModelRoutingStrategy(FakeRouter(), tolerance=0.20)
         strategy._litellm_router = type("R", (), {"model_list": [{"model_name": "x"}]})()
@@ -306,3 +322,135 @@ class TestModelRoutingStrategy:
             request_kwargs={"metadata": {"models": ["model-a"]}},
         )
         assert dep["model_name"] == "model-a"
+
+    def test_goose_title_generation_uses_cheapest_model(self):
+        """Goose title prompts are utility work, not a routing decision."""
+        strategy = ModelRoutingStrategy(FakeRouter("model-b"), tolerance=0.20)
+        strategy._litellm_router = type(
+            "R",
+            (),
+            {
+                "model_list": [
+                    {"model_name": "model-a", "litellm_params": {"model": "openai/a"}},
+                    {"model_name": "model-b", "litellm_params": {"model": "openai/b"}},
+                ]
+            },
+        )()
+
+        dep = strategy.get_available_deployment(
+            model="test",
+            messages=[
+                {
+                    "role": "user",
+                    "content": (
+                        "---BEGIN USER MESSAGES---\n"
+                        "how does this repo work?\n"
+                        "---END USER MESSAGES---\n\n"
+                        "Generate a short title for the above messages."
+                    ),
+                }
+            ],
+        )
+
+        assert dep["model_name"] == "model-a"
+        assert strategy.last_result is not None
+        assert strategy.last_result.metadata["pin_reason"] == "goose_title_generation"
+
+    def test_cheap_utility_pattern_uses_cheapest_model_for_cold_session(self):
+        strategy = ModelRoutingStrategy(
+            FakeRouter("model-b"),
+            tolerance=0.20,
+            cheap_patterns=[r"^\s*(list|show)\s+(the\s+)?files\b"],
+        )
+        strategy._litellm_router = type(
+            "R",
+            (),
+            {
+                "model_list": [
+                    {"model_name": "model-a", "litellm_params": {"model": "openai/a"}},
+                    {"model_name": "model-b", "litellm_params": {"model": "openai/b"}},
+                ]
+            },
+        )()
+
+        dep = strategy.get_available_deployment(
+            model="test",
+            messages=[{"role": "user", "content": "list files in this directory"}],
+            request_kwargs={"metadata": {"router_session_id": "cold"}},
+        )
+
+        assert dep["model_name"] == "model-a"
+        assert strategy.last_result is not None
+        assert strategy.last_result.metadata["pin_reason"] == "cheap_utility_pattern"
+
+    def test_goose_info_only_cold_uses_cheapest_model(self):
+        """Cold context-refresh turns should not independently escalate."""
+        strategy = ModelRoutingStrategy(FakeRouter("model-b"), tolerance=0.20)
+        strategy._litellm_router = type(
+            "R",
+            (),
+            {
+                "model_list": [
+                    {"model_name": "model-a", "litellm_params": {"model": "openai/a"}},
+                    {"model_name": "model-b", "litellm_params": {"model": "openai/b"}},
+                ]
+            },
+        )()
+
+        dep = strategy.get_available_deployment(
+            model="test",
+            messages=[
+                {
+                    "role": "user",
+                    "content": (
+                        "<info-msg>\n"
+                        "Working directory: /tmp/repo\n"
+                        "Context: ~7k/128k tokens used (6%)\n"
+                        "</info-msg>"
+                    ),
+                }
+            ],
+        )
+
+        assert dep["model_name"] == "model-a"
+        assert strategy.last_result is not None
+        assert strategy.last_result.metadata["pin_reason"] == "goose_info_only"
+
+    def test_goose_info_only_pins_existing_session_model(self):
+        """Once a session has a model, context-refresh turns preserve it."""
+        strategy = ModelRoutingStrategy(FakeRouter("model-b"), tolerance=0.20)
+        strategy._litellm_router = type(
+            "R",
+            (),
+            {
+                "model_list": [
+                    {"model_name": "model-a", "litellm_params": {"model": "openai/a"}},
+                    {"model_name": "model-b", "litellm_params": {"model": "openai/b"}},
+                ]
+            },
+        )()
+
+        strategy.get_available_deployment(
+            model="test",
+            messages=[{"role": "user", "content": "Fix the failing tests"}],
+            request_kwargs={"metadata": {"router_session_id": "s1"}},
+        )
+        dep = strategy.get_available_deployment(
+            model="test",
+            messages=[
+                {
+                    "role": "user",
+                    "content": (
+                        "<info-msg>\n"
+                        "Working directory: /tmp/repo\n"
+                        "Context: ~7k/128k tokens used (6%)\n"
+                        "</info-msg>"
+                    ),
+                }
+            ],
+            request_kwargs={"metadata": {"router_session_id": "s1"}},
+        )
+
+        assert dep["model_name"] == "model-b"
+        assert strategy.last_result is not None
+        assert strategy.last_result.metadata["pin_reason"] == "non_decision_turn"

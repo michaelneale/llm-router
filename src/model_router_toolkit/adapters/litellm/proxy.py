@@ -10,11 +10,119 @@ from __future__ import annotations
 import logging
 import os
 import time
+import uuid
 from pathlib import Path
+from typing import Any
+
+from starlette.requests import Request
 
 logger = logging.getLogger(__name__)
 
 _MIN_LITELLM_VERSION = "1.50.0"
+
+
+def _env_truthy(name: str) -> bool:
+    return os.environ.get(name, "").lower() in {"1", "true", "yes", "on"}
+
+
+def _env_falsey(name: str) -> bool:
+    return os.environ.get(name, "").lower() in {"0", "false", "no", "off"}
+
+
+def _routing_cost_blend(model: Any, output_token_weight: float) -> float:
+    multiplier = float(getattr(model, "routing_cost_multiplier", 1.0) or 1.0)
+    return round(
+        (
+            float(getattr(model, "cost_per_m_input_tokens", 0.0) or 0.0)
+            + output_token_weight
+            * float(getattr(model, "cost_per_m_output_tokens", 0.0) or 0.0)
+        )
+        * multiplier,
+        6,
+    )
+
+
+def _model_knob(model: Any, output_token_weight: float) -> dict[str, Any]:
+    return {
+        "slot": getattr(model, "name", ""),
+        "display_name": getattr(model, "display_name", "") or getattr(model, "name", ""),
+        "litellm_model": getattr(model, "litellm_model", ""),
+        "input_cost": float(getattr(model, "cost_per_m_input_tokens", 0.0) or 0.0),
+        "output_cost": float(getattr(model, "cost_per_m_output_tokens", 0.0) or 0.0),
+        "routing_cost_multiplier": float(
+            getattr(model, "routing_cost_multiplier", 1.0) or 1.0
+        ),
+        "routing_blend": _routing_cost_blend(model, output_token_weight),
+    }
+
+
+def _build_routing_knobs(
+    pool: Any,
+    *,
+    router_config: str,
+    litellm_config: str,
+) -> dict[str, Any]:
+    routing = getattr(pool, "routing", None)
+    switching = getattr(pool, "switching", None)
+    escalation = getattr(pool, "escalation", None)
+    utility = getattr(pool, "utility", None)
+
+    configured_tolerance = float(getattr(routing, "tolerance", 0.0) or 0.0)
+    env_tolerance = os.environ.get("ROUTER_TOLERANCE")
+    try:
+        effective_tolerance = (
+            float(env_tolerance) if env_tolerance not in (None, "") else configured_tolerance
+        )
+    except ValueError:
+        effective_tolerance = configured_tolerance
+
+    output_weight = float(getattr(routing, "output_token_weight", 0.0) or 0.0)
+    models = sorted(
+        (_model_knob(model, output_weight) for model in getattr(pool, "models", [])),
+        key=lambda m: (m["routing_blend"], m["input_cost"], m["output_cost"], m["slot"]),
+    )
+    by_slot = {m["slot"]: m for m in models}
+    top_slot = getattr(escalation, "top_tier_model", "") if escalation else ""
+
+    switching_disabled = _env_truthy("ROUTER_DISABLE_SWITCHING") or _env_falsey(
+        "ROUTER_SWITCHING"
+    )
+    switching_configured = bool(getattr(switching, "enabled", False))
+
+    patterns = (
+        list(getattr(escalation, "force_top_tier_when_prompt_matches", []) or [])
+        if escalation
+        else []
+    )
+    return {
+        "pool_config": router_config,
+        "litellm_config": litellm_config,
+        "route_log": os.environ.get("ROUTER_ROUTE_LOG", ""),
+        "configured_tolerance": configured_tolerance,
+        "env_tolerance": env_tolerance or "",
+        "effective_tolerance": max(0.0, min(1.0, effective_tolerance)),
+        "output_token_weight": output_weight,
+        "switching": {
+            "configured": switching_configured,
+            "effective": switching_configured and not switching_disabled,
+            "disabled_by_env": switching_disabled,
+            "up_margin": float(getattr(switching, "up_margin", 0.0) or 0.0),
+            "down_margin": float(getattr(switching, "down_margin", 0.0) or 0.0),
+            "down_margin_per_100k": float(
+                getattr(switching, "down_margin_per_100k", 0.0) or 0.0
+            ),
+            "max_down_margin": float(getattr(switching, "max_down_margin", 0.0) or 0.0),
+        },
+        "top_tier": by_slot.get(top_slot),
+        "manual_override": "!hard" if any("!hard" in p for p in patterns) else "",
+        "escalation_patterns": patterns,
+        "cheap_patterns": (
+            list(getattr(utility, "cheap_when_prompt_matches", []) or [])
+            if utility
+            else []
+        ),
+        "models": models,
+    }
 
 
 def _check_proxy_available() -> None:
@@ -113,6 +221,12 @@ def start_proxy(
     )
 
     tracker = get_tracker()
+    model_display_names: dict[str, str] = {}
+    routing_knobs: dict[str, Any] = {
+        "pool_config": router_config_abs,
+        "litellm_config": litellm_config,
+        "error": "router config was not loaded",
+    }
     # Map internal checkpoint slot names -> the real model they call, so the
     # dashboard shows "openai/gpt-5-mini" instead of the cosmetic NVIDIA slot
     # name "gpt-oss-120b-high".
@@ -120,11 +234,26 @@ def start_proxy(
         from model_router_toolkit.config import load_config
 
         _pool = load_config(router_config_abs)
+        model_display_names = {
+            m.name: (m.display_name or m.litellm_model or m.name)
+            for m in _pool.models
+        }
         tracker.set_display_names(
             {m.name: (m.litellm_model or m.display_name or m.name) for m in _pool.models}
         )
+        tracker.set_model_rates(
+            {
+                m.name: (m.cost_per_m_input_tokens, m.cost_per_m_output_tokens)
+                for m in _pool.models
+            }
+        )
+        routing_knobs = _build_routing_knobs(
+            _pool,
+            router_config=router_config_abs,
+            litellm_config=litellm_config,
+        )
     except Exception as e:  # pragma: no cover - display sugar only
-        logger.warning("Could not load display names for dashboard: %s", e)
+        logger.warning("Could not load model rates for dashboard: %s", e)
 
     _strategy_ref = None
 
@@ -152,6 +281,29 @@ def start_proxy(
     _COMPLETION_PATHS = ("/chat/completions", "/completions", "/v1/chat/completions",
                          "/v1/completions")
 
+    def _content_text(content) -> str:
+        if isinstance(content, str):
+            return content
+        if isinstance(content, list):
+            return " ".join(
+                p.get("text", "")
+                for p in content
+                if isinstance(p, dict) and p.get("type") == "text"
+            ).strip()
+        return ""
+
+    def _router_session_id(messages) -> str:
+        import hashlib
+
+        if isinstance(messages, list):
+            for msg in messages:
+                if isinstance(msg, dict) and msg.get("role") == "user":
+                    text = _content_text(msg.get("content")).strip()
+                    if text:
+                        digest = hashlib.sha256(text[:2000].encode()).hexdigest()[:16]
+                        return f"first-user:{digest}"
+        return f"request:{uuid.uuid4().hex}"
+
     class _RouterProxyMiddleware(BaseHTTPMiddleware):
         """Patch the response ``model`` field to reflect the actual routed
         model (litellm echoes the request model name, not the deployment) and
@@ -165,12 +317,15 @@ def start_proxy(
         """
 
         async def dispatch(self, request: Request, call_next) -> Response:
+            is_completion = any(request.url.path.endswith(p) for p in _COMPLETION_PATHS)
+            request_id: str | None = None
+
             # 1. For completion requests, force include_usage on streaming so we
             #    can count tokens. We must read + replace the request body.
-            if any(request.url.path.endswith(p) for p in _COMPLETION_PATHS):
+            if is_completion:
                 raw = await request.body()
-                new_raw = _force_include_usage(raw)
-                if new_raw is not raw:
+                new_raw, request_id = _prepare_completion_body(raw)
+                if new_raw != raw:
                     # Re-serve the (possibly modified) body to downstream handlers.
                     async def _receive():
                         return {"type": "http.request", "body": new_raw,
@@ -180,11 +335,20 @@ def start_proxy(
 
             response = await call_next(request)
 
-            strategy = _strategy_ref
-            if not (strategy and getattr(strategy, "last_result", None)):
+            if not is_completion:
                 return response
 
-            result = strategy.last_result
+            strategy = _strategy_ref
+            result = None
+            if strategy:
+                pop_result = getattr(strategy, "pop_result", None)
+                if callable(pop_result):
+                    result = pop_result(request_id)
+                if result is None:
+                    result = getattr(strategy, "last_result", None)
+            if result is None:
+                return response
+
             selected = result.selected_model
             response.headers["X-Model-Router-Selected"] = selected
             content_type = response.headers.get("content-type", "")
@@ -204,7 +368,7 @@ def start_proxy(
 
                 usage = extract_usage(body)
                 if usage is not None:
-                    tracker.record(result, usage[0], usage[1])
+                    tracker.record(result, usage)
 
                 headers = dict(response.headers)
                 headers["content-length"] = str(len(body))
@@ -233,7 +397,7 @@ def start_proxy(
                     # Stream finished — extract usage from the accumulated SSE.
                     usage = extract_usage_from_sse("".join(buf_parts))
                     if usage is not None:
-                        tracker.record(result, usage[0], usage[1])
+                        tracker.record(result, usage)
 
                 headers = dict(response.headers)
                 headers.pop("content-length", None)
@@ -246,28 +410,37 @@ def start_proxy(
 
             return response
 
-    def _force_include_usage(raw: bytes):
-        """If the request is a streaming completion, set
-        ``stream_options.include_usage=true`` so the upstream emits usage.
+    def _prepare_completion_body(raw: bytes) -> tuple[bytes, str | None]:
+        """Attach router request/session metadata and include streaming usage.
 
-        Returns the original ``raw`` unchanged if no edit is needed, else new bytes.
+        Returns ``(body, request_id)``.
         """
         if not raw:
-            return raw
+            return raw, None
         try:
             data = _json.loads(raw)
         except (ValueError, TypeError):
-            return raw
-        if not isinstance(data, dict) or not data.get("stream"):
-            return raw
-        opts = data.get("stream_options")
-        if not isinstance(opts, dict):
-            opts = {}
-        if opts.get("include_usage") is True:
-            return raw
-        opts["include_usage"] = True
-        data["stream_options"] = opts
-        return _json.dumps(data).encode()
+            return raw, None
+        if not isinstance(data, dict):
+            return raw, None
+
+        metadata = data.get("metadata")
+        if not isinstance(metadata, dict):
+            metadata = {}
+        request_id = str(metadata.get("router_request_id") or uuid.uuid4().hex)
+        metadata["router_request_id"] = request_id
+        metadata.setdefault("router_session_id", _router_session_id(data.get("messages")))
+        data["metadata"] = metadata
+        data["litellm_metadata"] = dict(metadata)
+
+        if data.get("stream"):
+            opts = data.get("stream_options")
+            if not isinstance(opts, dict):
+                opts = {}
+            opts["include_usage"] = True
+            data["stream_options"] = opts
+
+        return _json.dumps(data).encode(), request_id
 
     litellm_app.add_middleware(_RouterProxyMiddleware)
 
@@ -277,12 +450,78 @@ def start_proxy(
 
     @litellm_app.get("/savings")
     async def _savings():  # noqa: ANN202
-        return JSONResponse(tracker.snapshot())
+        snapshot = tracker.snapshot()
+        snapshot["routing_knobs"] = routing_knobs
+        return JSONResponse(snapshot)
 
     @litellm_app.post("/savings/reset")
     async def _savings_reset():  # noqa: ANN202
         tracker.reset()
         return JSONResponse({"status": "reset"})
+
+    @litellm_app.post("/router/route")
+    async def _route_probe(request: Request):  # noqa: ANN202
+        """Route without calling a provider.
+
+        This exercises the same LiteLLM routing strategy as chat completions,
+        including task-view shaping, pins, policy escalation, switch gates, and
+        ROUTER_ROUTE_LOG writes. Request ids are prefixed with ``probe-`` so
+        aggregate real-traffic analysis can ignore these rows by default.
+        """
+
+        strategy = _strategy_ref
+        if strategy is None:
+            return JSONResponse(
+                {"error": "routing strategy is not initialized"},
+                status_code=503,
+            )
+
+        try:
+            body = await request.json()
+        except Exception:
+            body = {}
+        if not isinstance(body, dict):
+            body = {}
+
+        messages = body.get("messages") or []
+        if "tolerance" in body:
+            strategy.set_request_tolerance(float(body.get("tolerance", 0.20)))
+
+        metadata = body.get("metadata")
+        if not isinstance(metadata, dict):
+            metadata = {}
+        else:
+            metadata = dict(metadata)
+        if "models" in body:
+            metadata["models"] = body["models"]
+        request_id = f"probe-{uuid.uuid4().hex}"
+        metadata["router_request_id"] = request_id
+        metadata.setdefault("router_session_id", _router_session_id(messages))
+
+        dep = strategy.get_available_deployment(
+            model=body.get("model") or "nvidia-routed",
+            messages=messages,
+            request_kwargs={"metadata": metadata},
+        )
+        result = strategy.pop_result(request_id) or strategy.last_result
+        selected = result.selected_model if result is not None else dep.get("model_name")
+        litellm_params = dep.get("litellm_params") or {}
+        response = {
+            "id": request_id,
+            "object": "router.route",
+            "selected_model": selected,
+            "selected_display": model_display_names.get(selected, selected),
+            "deployment": dep.get("model_name"),
+            "litellm_model": litellm_params.get("model"),
+            "routing": None,
+        }
+        if result is not None:
+            response["routing"] = {
+                "selected_model": result.selected_model,
+                "confidences": dict(zip(result.model_names, result.confidences)),
+                "metadata": result.metadata,
+            }
+        return JSONResponse(response)
 
     @litellm_app.get("/dashboard")
     async def _dashboard():  # noqa: ANN202

@@ -32,6 +32,12 @@ USER_TEXT_CAP = 500
 SYNOPSIS_CAP = 180
 
 _TOOL_NOISE = re.compile(r"(toolResponse|tool_call_id|\"status\"\s*:\s*\"success\")")
+_INFO_MSG = re.compile(r"<info-msg>.*?</info-msg>", re.IGNORECASE | re.DOTALL)
+_GOOSE_TITLE_REQUEST = re.compile(
+    r"^\s*---BEGIN USER MESSAGES---.*---END USER MESSAGES---\s*"
+    r"Generate a short title for the above messages\.?\s*$",
+    re.IGNORECASE | re.DOTALL,
+)
 
 # Agents (goose) inject user-role messages that *narrate* a tool result rather
 # than express user intent — e.g. "A grep search of the two config files found
@@ -90,6 +96,22 @@ def _is_tool_turn(msg: dict) -> bool:
     return False
 
 
+def strip_info_messages(text: str) -> str:
+    """Remove Goose's injected <info-msg> blocks from a user turn."""
+    return _INFO_MSG.sub("", text).strip()
+
+
+def is_goose_title_request(text: str) -> bool:
+    """True for Goose's automatic title-generation prompt."""
+    return bool(_GOOSE_TITLE_REQUEST.match(text.strip()))
+
+
+def is_info_only_request(text: str) -> bool:
+    """True when the user-role turn only carries Goose runtime context."""
+    stripped = text.strip()
+    return stripped.startswith("<info-msg>") and not strip_info_messages(stripped)
+
+
 def _last_user_intent(messages: list[dict]) -> str | None:
     """The most recent genuine user message text, or None if the last
     user-role turn is actually a tool result / empty (= not a routing event)."""
@@ -105,6 +127,11 @@ def _last_user_intent(messages: list[dict]) -> str | None:
         if _is_tool_turn(msg):
             return None  # last user turn is a tool dump -> not a decision
         text = _content_text(msg.get("content")).strip()
+        if not text:
+            return None
+        if is_goose_title_request(text):
+            return None
+        text = strip_info_messages(text)
         if not text:
             return None
         if _SUMMARY_NARRATION.match(text):

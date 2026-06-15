@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import json
+import uuid
 from typing import Any
 
 from fastapi import APIRouter, Request
@@ -33,6 +34,8 @@ async def _handle_completion(request: Request, body: dict) -> JSONResponse | Str
     metadata: dict[str, Any] = {}
     if "models" in body:
         metadata["models"] = body["models"]
+    request_id = uuid.uuid4().hex
+    metadata["router_request_id"] = request_id
 
     kwargs: dict[str, Any] = {
         "model": model_group,
@@ -41,8 +44,7 @@ async def _handle_completion(request: Request, body: dict) -> JSONResponse | Str
         "max_tokens": max_tokens,
         "stream": stream,
     }
-    if metadata:
-        kwargs["metadata"] = metadata
+    kwargs["metadata"] = metadata
 
     if stream:
 
@@ -68,26 +70,33 @@ async def _handle_completion(request: Request, body: dict) -> JSONResponse | Str
         if "content" not in msg:
             msg["content"] = ""
 
-    if strategy.last_result:
+    result = None
+    pop_result = getattr(strategy, "pop_result", None)
+    if callable(pop_result):
+        result = pop_result(request_id)
+    if result is None:
+        result = strategy.last_result
+
+    if result:
         result_data["routing"] = {
-            "selected_model": strategy.last_result.selected_model,
+            "selected_model": result.selected_model,
             "confidences": dict(
                 zip(
-                    strategy.last_result.model_names,
-                    strategy.last_result.confidences,
+                    result.model_names,
+                    result.confidences,
                 )
             ),
-            "metadata": strategy.last_result.metadata,
+            "metadata": result.metadata,
         }
 
     from model_router_toolkit import telemetry
 
-    if telemetry.enabled() and strategy.last_result:
+    if telemetry.enabled() and result:
         user_text = extract_user_text(messages)
         telemetry.log_chat(
             session_id=None,
             question=user_text,
-            selected_model=strategy.last_result.selected_model,
+            selected_model=result.selected_model,
         )
 
     return JSONResponse(content=result_data)
@@ -97,3 +106,62 @@ async def _handle_completion(request: Request, body: dict) -> JSONResponse | Str
 async def chat_completions(request: Request):
     body = await request.json()
     return await _handle_completion(request, body)
+
+
+@router.post("/route")
+async def route_only(request: Request):
+    """Return the LiteLLM strategy's routing decision without calling a provider.
+
+    This intentionally exercises the same strategy path as /chat/completions
+    (task-view shaping, pins, policy escalation, switching gates, and route
+    logging) but stops before LiteLLM sends the request upstream.
+    """
+
+    body = await request.json()
+    strategy = request.app.state.strategy
+    config = request.app.state.config
+
+    messages = body.get("messages", [])
+    if "tolerance" in body:
+        strategy.set_request_tolerance(float(body.get("tolerance", 0.20)))
+
+    metadata: dict[str, Any] = {}
+    body_metadata = body.get("metadata") or {}
+    if isinstance(body_metadata, dict):
+        metadata.update(body_metadata)
+    if "models" in body:
+        metadata["models"] = body["models"]
+    request_id = f"probe-{uuid.uuid4().hex}"
+    metadata["router_request_id"] = request_id
+
+    model_group = body.get("model") or "nvidia-routed"
+    dep = strategy.get_available_deployment(
+        model=model_group,
+        messages=messages,
+        request_kwargs={"metadata": metadata},
+    )
+    result = strategy.pop_result(request_id) or strategy.last_result
+    selected = result.selected_model if result else dep.get("model_name")
+
+    litellm_params = dep.get("litellm_params") or {}
+    display = {
+        model.name: (model.display_name or model.name)
+        for model in getattr(config, "models", [])
+    }
+    response = {
+        "id": request_id,
+        "object": "router.route",
+        "model": model_group,
+        "selected_model": selected,
+        "selected_display": display.get(selected, selected),
+        "litellm_model": litellm_params.get("model"),
+        "deployment": dep.get("model_name"),
+        "routing": None,
+    }
+    if result is not None:
+        response["routing"] = {
+            "selected_model": result.selected_model,
+            "confidences": dict(zip(result.model_names, result.confidences)),
+            "metadata": result.metadata,
+        }
+    return JSONResponse(content=response)

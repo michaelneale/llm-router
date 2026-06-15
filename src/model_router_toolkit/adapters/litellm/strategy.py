@@ -14,11 +14,21 @@ from __future__ import annotations
 
 import asyncio
 import contextvars
+import hashlib
+import json
 import logging
+import os
+import threading
+import time
 from typing import Any
 
 from model_router_toolkit.router import BaseRouter, RoutingResult, extract_user_text
-from model_router_toolkit.task_view import build_task_view
+from model_router_toolkit.task_view import (
+    build_task_view,
+    is_goose_title_request,
+    is_info_only_request,
+    strip_info_messages,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -46,6 +56,7 @@ class ModelRoutingStrategy:
         models: list[str] | None = None,
         escalation_patterns: list[str] | None = None,
         escalation_model: str = "",
+        cheap_patterns: list[str] | None = None,
         depth_tolerance: Any = None,
         switching: Any = None,
     ):
@@ -56,10 +67,11 @@ class ModelRoutingStrategy:
         self._models = models
         self._litellm_router: Any = None
         self._last_result: RoutingResult | None = None
-        # Last model we actually routed to. When a turn is NOT a routing decision
-        # (a tool result or agent narration, ~75% of agent turns), we pin to this
-        # instead of scoring noise — which also preserves the provider's prompt
-        # cache across the turn (switching busts the cache on big-context agents).
+        self._results_by_request: dict[str, RoutingResult] = {}
+        self._session_selected: dict[str, str] = {}
+        self._state_lock = threading.Lock()
+        # Last model we actually routed to, kept as a process-wide debug mirror.
+        # Pinning uses _session_selected instead.
         self._last_selected_model: str | None = None
         # Depth-scaled tolerance: tighten tolerance (-> escalate) as the session
         # deepens, because completeness failures cluster deep, not early.
@@ -72,6 +84,11 @@ class ModelRoutingStrategy:
         self._escalation_res = [
             _re.compile(p, _re.IGNORECASE) for p in (escalation_patterns or [])
         ]
+        self._cheap_res = [
+            _re.compile(p, _re.IGNORECASE) for p in (cheap_patterns or [])
+        ]
+        self._route_log_path = os.environ.get("ROUTER_ROUTE_LOG", "")
+        self._route_log_lock = threading.Lock()
 
     @classmethod
     def from_config(cls, config_path: str, **kwargs: Any) -> ModelRoutingStrategy:
@@ -81,16 +98,31 @@ class ModelRoutingStrategy:
         config = load_config(config_path)
         router = build_router_from_config(config)
         esc = config.escalation
+        utility = config.utility
+        if "tolerance" not in kwargs:
+            tolerance = config.routing.tolerance
+            if env_tolerance := os.environ.get("ROUTER_TOLERANCE"):
+                try:
+                    tolerance = float(env_tolerance)
+                except ValueError as exc:
+                    raise ValueError(
+                        f"ROUTER_TOLERANCE must be a float, got {env_tolerance!r}"
+                    ) from exc
+            kwargs["tolerance"] = tolerance
         kwargs.setdefault("escalation_patterns", esc.force_top_tier_when_prompt_matches)
         kwargs.setdefault("escalation_model", esc.top_tier_model)
+        kwargs.setdefault("cheap_patterns", utility.cheap_when_prompt_matches)
         kwargs.setdefault("depth_tolerance", config.depth_tolerance)
         kwargs.setdefault("switching", getattr(config, "switching", None))
-        return cls(router, tolerance=config.routing.tolerance, **kwargs)
+        return cls(router, **kwargs)
 
     def _escalates(self, text: str) -> bool:
         return bool(self._escalation_model) and any(
             r.search(text) for r in self._escalation_res
         )
+
+    def _cheap_utility(self, text: str) -> bool:
+        return any(r.search(text) for r in self._cheap_res)
 
     def _session_depth(self, messages: list[dict] | None) -> int:
         """Estimate how deep the session is from the incoming message list.
@@ -152,6 +184,13 @@ class ModelRoutingStrategy:
     def last_result(self) -> RoutingResult | None:
         return self._last_result
 
+    def pop_result(self, request_id: str | None) -> RoutingResult | None:
+        """Return and remove the routing result for a specific request."""
+        if not request_id:
+            return None
+        with self._state_lock:
+            return self._results_by_request.pop(request_id, None)
+
     @property
     def router(self) -> BaseRouter:
         return self._router
@@ -166,6 +205,183 @@ class ModelRoutingStrategy:
             if isinstance(dep, dict) and dep.get("model_name") == model_name:
                 return dep
         return None
+
+    def _pool_model_names(self) -> list[str]:
+        config = getattr(self._router, "_config", None)
+        if config is not None and hasattr(config, "model_names"):
+            return list(config.model_names)
+        if self._models:
+            return list(self._models)
+        if self._litellm_router is not None:
+            return [
+                dep.get("model_name")
+                for dep in self._litellm_router.model_list
+                if isinstance(dep, dict) and dep.get("model_name")
+            ]
+        return []
+
+    def _cheapest_model(self, allowed: list[str] | None = None) -> str | None:
+        allowed_set = set(allowed) if allowed else None
+        candidates: list[tuple[float, float, str]] = []
+        for name in self._pool_model_names():
+            if allowed_set is not None and name not in allowed_set:
+                continue
+            result = self._router.resolve(name)
+            if result is None:
+                continue
+            cost = result.selected_cost
+            candidates.append(
+                (cost.cost_per_m_input_tokens, cost.cost_per_m_output_tokens, name)
+            )
+        if not candidates:
+            return None
+        return min(candidates)[2]
+
+    def _select_utility_model(
+        self,
+        *,
+        session_key: str,
+        request_id: str | None,
+        messages: list[dict] | None,
+        task_view: str,
+        reason: str,
+        remember: bool = False,
+        allowed: list[str] | None = None,
+    ) -> dict | None:
+        model_name = self._cheapest_model(allowed)
+        if not model_name:
+            return None
+        dep = self._find_deployment(model_name)
+        if dep is None:
+            return None
+        result = self._router.resolve(model_name)
+        if result is not None:
+            result.metadata["pin_reason"] = reason
+            result.metadata["utility"] = True
+            if remember:
+                self._set_last_selected(session_key, model_name)
+            self._store_result(request_id, result)
+            self._log_route(
+                request_id=request_id,
+                session_key=session_key,
+                decision="cheap_utility",
+                result=result,
+                task_view=task_view,
+                messages=messages,
+            )
+        return dep
+
+    def _metadata(self, request_kwargs: dict | None) -> dict:
+        if not request_kwargs:
+            return {}
+        merged = {}
+        for key in ("metadata", "litellm_metadata"):
+            metadata = request_kwargs.get(key) or {}
+            if isinstance(metadata, dict):
+                merged.update(metadata)
+        return merged
+
+    def _request_id(self, request_kwargs: dict | None) -> str | None:
+        metadata = self._metadata(request_kwargs)
+        rid = metadata.get("router_request_id")
+        return str(rid) if rid else None
+
+    def _session_key(
+        self,
+        messages: list[dict] | None,
+        request_kwargs: dict | None,
+    ) -> str:
+        metadata = self._metadata(request_kwargs)
+        for key in (
+            "router_session_id",
+            "session_id",
+            "conversation_id",
+            "thread_id",
+            "chat_id",
+        ):
+            val = metadata.get(key)
+            if val:
+                return str(val)
+
+        # Goose does not currently send a session id through the OpenAI API path.
+        # Hash the first real user message so all later full-context requests in
+        # the same session share routing/cache state without leaking the prompt in
+        # process state.
+        if messages:
+            for msg in messages:
+                if msg.get("role") == "user":
+                    text = self._extract_user_text([msg]).strip()
+                    if is_goose_title_request(text):
+                        continue
+                    text = strip_info_messages(text).strip()
+                    if text:
+                        digest = hashlib.sha256(text[:2000].encode()).hexdigest()[:16]
+                        return f"first-user:{digest}"
+        return "default"
+
+    def _get_last_selected(self, session_key: str) -> str | None:
+        with self._state_lock:
+            return self._session_selected.get(session_key)
+
+    def _set_last_selected(self, session_key: str, model_name: str) -> None:
+        with self._state_lock:
+            self._session_selected[session_key] = model_name
+            self._last_selected_model = model_name
+
+    def _store_result(self, request_id: str | None, result: RoutingResult) -> None:
+        with self._state_lock:
+            self._last_result = result
+            if request_id:
+                self._results_by_request[request_id] = result
+
+    def _switching_enabled(self) -> bool:
+        sw = self._switching
+        if os.environ.get("ROUTER_DISABLE_SWITCHING", "").lower() in {"1", "true", "yes", "on"}:
+            return False
+        if os.environ.get("ROUTER_SWITCHING", "").lower() in {"0", "false", "no", "off"}:
+            return False
+        return bool(sw and getattr(sw, "enabled", False))
+
+    def _log_route(
+        self,
+        *,
+        request_id: str | None,
+        session_key: str,
+        decision: str,
+        result: RoutingResult | None,
+        task_view: str,
+        messages: list[dict] | None,
+        extra: dict | None = None,
+    ) -> None:
+        if not self._route_log_path:
+            return
+        row = {
+            "ts": time.time(),
+            "request_id": request_id,
+            "session_key": session_key,
+            "decision": decision,
+            "selected_model": result.selected_model if result else None,
+            "session_depth": self._session_depth(messages),
+            "context_tokens_est": self._context_tokens(messages),
+            "task_view": task_view[:1200],
+            "metadata": result.metadata if result else {},
+            "confidences": (
+                {
+                    name: round(float(conf), 4)
+                    for name, conf in zip(result.model_names, result.confidences)
+                }
+                if result
+                else {}
+            ),
+        }
+        if extra:
+            row.update(extra)
+        try:
+            with self._route_log_lock:
+                with open(self._route_log_path, "a") as f:
+                    f.write(json.dumps(row, sort_keys=True) + "\n")
+        except OSError:
+            logger.warning("Could not write route log to %s", self._route_log_path)
 
     def _context_tokens(self, messages: list[dict] | None) -> int:
         """Rough size of the cached prefix at risk, in tokens (~4 chars/token)."""
@@ -183,7 +399,7 @@ class ModelRoutingStrategy:
         return chars // 4
 
     def _apply_switch_gate(
-        self, result: RoutingResult, messages: list[dict] | None
+        self, result: RoutingResult, messages: list[dict] | None, session_key: str
     ) -> RoutingResult:
         """Cache-aware asymmetric switching. The router has chosen the best model
         for this turn; decide whether the predicted gain justifies leaving the
@@ -192,9 +408,9 @@ class ModelRoutingStrategy:
         is small when escalating and large (and context-scaled) when de-escalating.
         """
         sw = self._switching
-        if not sw or not getattr(sw, "enabled", False):
+        if not self._switching_enabled():
             return result
-        cur = self._last_selected_model
+        cur = self._get_last_selected(session_key)
         cand = result.selected_model
         if not cur or cur == cand or cur not in result.model_names:
             return result
@@ -227,25 +443,61 @@ class ModelRoutingStrategy:
             "Switch gate: stay on %s (cand %s gain %.3f < margin %.3f, %s)",
             cur, cand, gain, margin, "down" if going_down else "up",
         )
-        stay = self._router.resolve(cur)
-        return stay if stay is not None else result
+        meta = dict(result.metadata)
+        meta["switch_gate"] = {
+            "stayed_on": cur,
+            "candidate": cand,
+            "gain": round(float(gain), 4),
+            "margin": round(float(margin), 4),
+            "direction": "down" if going_down else "up",
+        }
+        return RoutingResult(
+            model_names=result.model_names,
+            confidences=result.confidences,
+            costs=result.costs,
+            selected_model=cur,
+            metadata=meta,
+        )
 
-    def _pin_to_last(self) -> dict | None:
+    def _pin_to_last(
+        self,
+        session_key: str,
+        request_id: str | None,
+        messages: list[dict] | None,
+        task_view: str,
+    ) -> dict | None:
         """Return the deployment for the last model we routed to, or None if we
         have not made a routing decision yet this session. Used for non-decision
         turns (tool results / narration) so we stay on the cached model.
         """
-        if not self._last_selected_model:
+        last_selected = self._get_last_selected(session_key)
+        if not last_selected:
             return None
-        dep = self._find_deployment(self._last_selected_model)
+        dep = self._find_deployment(last_selected)
         if dep is None:
             return None
-        pinned = self._router.resolve(self._last_selected_model)
+        pinned = self._router.resolve(last_selected)
         if pinned is not None:
-            self._last_result = pinned
+            pinned.metadata["pin_reason"] = "non_decision_turn"
+            self._store_result(request_id, pinned)
+            self._log_route(
+                request_id=request_id,
+                session_key=session_key,
+                decision="pin_non_decision",
+                result=pinned,
+                task_view=task_view,
+                messages=messages,
+            )
         return dep
 
-    def _try_pin(self, request_kwargs: dict | None) -> dict | None:
+    def _try_pin(
+        self,
+        request_kwargs: dict | None,
+        *,
+        session_key: str,
+        request_id: str | None,
+        messages: list[dict] | None,
+    ) -> dict | None:
         """Check request_kwargs for an explicit pin_model directive.
 
         Returns the pinned deployment dict, or None to fall through to
@@ -254,14 +506,24 @@ class ModelRoutingStrategy:
         """
         if not request_kwargs:
             return None
-        metadata = request_kwargs.get("metadata") or {}
+        metadata = self._metadata(request_kwargs)
         pin = metadata.get("pin_model")
         if not pin or not self._router.has_model(pin):
             return None
         pinned = self._router.resolve(pin)
         if pinned is None:
             return None
-        self._last_result = pinned
+        pinned.metadata["pin_reason"] = "explicit_pin_model"
+        self._set_last_selected(session_key, pin)
+        self._store_result(request_id, pinned)
+        self._log_route(
+            request_id=request_id,
+            session_key=session_key,
+            decision="explicit_pin",
+            result=pinned,
+            task_view="",
+            messages=messages,
+        )
         return self._find_deployment(pin)
 
     def _route_and_select(
@@ -272,8 +534,16 @@ class ModelRoutingStrategy:
         request_kwargs: dict | None = None,
         **kwargs: Any,
     ) -> dict:
+        request_id = self._request_id(request_kwargs)
+        session_key = self._session_key(messages, request_kwargs)
+
         # Explicit pin via metadata — for router-per-subagent flows.
-        dep = self._try_pin(request_kwargs)
+        dep = self._try_pin(
+            request_kwargs,
+            session_key=session_key,
+            request_id=request_id,
+            messages=messages,
+        )
         if dep:
             return dep
 
@@ -282,11 +552,52 @@ class ModelRoutingStrategy:
         # agent narration). In that case pin to the model we last chose: it keeps
         # the request on a model that already has the conversation cached, and
         # avoids scoring machine-noise the classifier was never trained on.
+        raw_text = self._extract_user_text(messages).strip()
+        req_models = self._metadata(request_kwargs).get("models")
+        allowed = req_models or self._models
+
+        if is_goose_title_request(raw_text):
+            dep = self._select_utility_model(
+                session_key=session_key,
+                request_id=request_id,
+                messages=messages,
+                task_view=raw_text,
+                reason="goose_title_generation",
+                allowed=allowed,
+            )
+            if dep is not None:
+                return dep
+
+        if self._cheap_utility(raw_text) and self._get_last_selected(session_key) is None:
+            dep = self._select_utility_model(
+                session_key=session_key,
+                request_id=request_id,
+                messages=messages,
+                task_view=raw_text,
+                reason="cheap_utility_pattern",
+                remember=True,
+                allowed=allowed,
+            )
+            if dep is not None:
+                return dep
+
         text = build_task_view(messages)
         if text is None:
-            pinned = self._pin_to_last()
+            pinned = self._pin_to_last(session_key, request_id, messages, "")
             if pinned is not None:
                 return pinned
+            if is_info_only_request(raw_text):
+                dep = self._select_utility_model(
+                    session_key=session_key,
+                    request_id=request_id,
+                    messages=messages,
+                    task_view=raw_text,
+                    reason="goose_info_only",
+                    remember=True,
+                    allowed=allowed,
+                )
+                if dep is not None:
+                    return dep
             # no prior decision yet (cold session opening on a tool turn) — fall
             # back to bare extraction so we still route something sensible.
             text = self._extract_user_text(messages)
@@ -294,7 +605,8 @@ class ModelRoutingStrategy:
             text = input
 
         if not text:
-            self._last_result = None
+            with self._state_lock:
+                self._last_result = None
             if self._litellm_router:
                 return self._litellm_router.model_list[0]
             return {}
@@ -303,31 +615,48 @@ class ModelRoutingStrategy:
         # per-turn but need the top tier for the whole task. Imposed by rule, not
         # learned — see docs/ROUTING_FINDINGS.md (the "poll CI until done" case).
         if self._escalates(text):
-            from model_router_toolkit.router import RoutingResult as _RR
-
             dep = self._find_deployment(self._escalation_model)
             if dep:
-                self._last_result = _RR(
-                    model_names=[self._escalation_model],
-                    confidences=[1.0],
-                    costs=[],
-                    selected_model=self._escalation_model,
-                    metadata={"escalated": True},
+                result = self._router.resolve(self._escalation_model)
+                if result is None:
+                    return dep
+                result.metadata["escalated"] = True
+                self._set_last_selected(session_key, self._escalation_model)
+                self._store_result(request_id, result)
+                self._log_route(
+                    request_id=request_id,
+                    session_key=session_key,
+                    decision="policy_escalation",
+                    result=result,
+                    task_view=text,
+                    messages=messages,
                 )
                 logger.info("Escalation policy -> %s", self._escalation_model)
                 return dep
 
-        req_models = ((request_kwargs or {}).get("metadata") or {}).get("models")
-        allowed = req_models or self._models
         tol = self._depth_scaled_tolerance(self.effective_tolerance, messages)
         result = self._router.route(
             text,
             tolerance=tol,
             models=allowed,
         )
-        result = self._apply_switch_gate(result, messages)
-        self._last_result = result
-        self._last_selected_model = result.selected_model
+        raw_selected = result.selected_model
+        result = self._apply_switch_gate(result, messages, session_key)
+        self._store_result(request_id, result)
+        self._set_last_selected(session_key, result.selected_model)
+        self._log_route(
+            request_id=request_id,
+            session_key=session_key,
+            decision="route",
+            result=result,
+            task_view=text,
+            messages=messages,
+            extra={
+                "raw_selected_model": raw_selected,
+                "tolerance": tol,
+                "allowed_models": allowed,
+            },
+        )
 
         dep = self._find_deployment(result.selected_model)
         if dep:
