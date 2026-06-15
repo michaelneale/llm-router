@@ -7,6 +7,8 @@ without retraining.
 The live proxy also exposes the effective settings on `/dashboard` under
 Routing knobs, including env tolerance overrides, the weighted cost ladder,
 switching margins, the top-tier override, and the route log path.
+The tolerance value can be changed live from the dashboard; that updates the
+in-process router default for future requests without editing YAML or restarting.
 
 ## Main Quality/Cost Knob
 
@@ -31,6 +33,16 @@ You can override without editing YAML:
 ```bash
 ROUTER_TOLERANCE=0.11 scripts/router-service.sh restart
 ```
+
+Or change it live while the proxy is running:
+
+```bash
+curl -X POST http://localhost:4000/router/tuning \
+  -H 'Content-Type: application/json' \
+  -d '{"tolerance":0.145}'
+```
+
+Live changes reset to the YAML/env default on proxy restart.
 
 ## Tier Weights
 

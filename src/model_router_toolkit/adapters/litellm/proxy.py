@@ -56,6 +56,31 @@ def _model_knob(model: Any, output_token_weight: float) -> dict[str, Any]:
     }
 
 
+def _recommended_tolerances() -> list[dict[str, Any]]:
+    return [
+        {
+            "label": "Quality",
+            "value": 0.040,
+            "note": "equivalent-quality check",
+        },
+        {
+            "label": "Small loss",
+            "value": 0.110,
+            "note": "conservative savings",
+        },
+        {
+            "label": "Aggressive",
+            "value": 0.145,
+            "note": "current high-savings trial",
+        },
+        {
+            "label": "Cheaper",
+            "value": 0.180,
+            "note": "explore lower cost",
+        },
+    ]
+
+
 def _build_routing_knobs(
     pool: Any,
     *,
@@ -77,6 +102,7 @@ def _build_routing_knobs(
         effective_tolerance = configured_tolerance
 
     output_weight = float(getattr(routing, "output_token_weight", 0.0) or 0.0)
+    tolerance_source = "env" if env_tolerance not in (None, "") else "config"
     models = sorted(
         (_model_knob(model, output_weight) for model in getattr(pool, "models", [])),
         key=lambda m: (m["routing_blend"], m["input_cost"], m["output_cost"], m["slot"]),
@@ -101,6 +127,9 @@ def _build_routing_knobs(
         "configured_tolerance": configured_tolerance,
         "env_tolerance": env_tolerance or "",
         "effective_tolerance": max(0.0, min(1.0, effective_tolerance)),
+        "startup_tolerance": max(0.0, min(1.0, effective_tolerance)),
+        "tolerance_source": tolerance_source,
+        "recommended_tolerances": _recommended_tolerances(),
         "output_token_weight": output_weight,
         "switching": {
             "configured": switching_configured,
@@ -448,16 +477,65 @@ def start_proxy(
 
     from model_router_toolkit.adapters.litellm.dashboard import DASHBOARD_HTML
 
+    def _current_routing_knobs() -> dict[str, Any]:
+        knobs = dict(routing_knobs)
+        strategy = _strategy_ref
+        if strategy is None or "error" in knobs:
+            return knobs
+        current = float(strategy.tolerance)
+        startup = float(knobs.get("startup_tolerance", current) or current)
+        knobs["effective_tolerance"] = current
+        knobs["runtime_tolerance"] = current
+        if abs(current - startup) > 1e-9:
+            knobs["tolerance_source"] = "runtime"
+        return knobs
+
     @litellm_app.get("/savings")
     async def _savings():  # noqa: ANN202
         snapshot = tracker.snapshot()
-        snapshot["routing_knobs"] = routing_knobs
+        snapshot["routing_knobs"] = _current_routing_knobs()
         return JSONResponse(snapshot)
 
     @litellm_app.post("/savings/reset")
     async def _savings_reset():  # noqa: ANN202
         tracker.reset()
         return JSONResponse({"status": "reset"})
+
+    @litellm_app.get("/router/tuning")
+    async def _router_tuning():  # noqa: ANN202
+        return JSONResponse({"routing_knobs": _current_routing_knobs()})
+
+    @litellm_app.post("/router/tuning")
+    async def _router_tuning_update(request: Request):  # noqa: ANN202
+        strategy = _strategy_ref
+        if strategy is None:
+            return JSONResponse(
+                {"error": "routing strategy is not initialized"},
+                status_code=503,
+            )
+        try:
+            body = await request.json()
+        except Exception:
+            body = {}
+        if not isinstance(body, dict):
+            body = {}
+
+        if "tolerance" in body:
+            try:
+                tolerance = float(body["tolerance"])
+            except (TypeError, ValueError):
+                return JSONResponse(
+                    {"error": "tolerance must be a number"},
+                    status_code=400,
+                )
+            if not 0.0 <= tolerance <= 1.0:
+                return JSONResponse(
+                    {"error": "tolerance must be between 0 and 1"},
+                    status_code=400,
+                )
+            strategy.tolerance = tolerance
+
+        return JSONResponse({"routing_knobs": _current_routing_knobs()})
 
     @litellm_app.post("/router/route")
     async def _route_probe(request: Request):  # noqa: ANN202
