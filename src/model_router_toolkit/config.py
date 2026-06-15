@@ -66,10 +66,40 @@ class DepthToleranceConfig(BaseModel):
     depth_metric: str = "turns"  # "turns" (assistant msgs) or "tools" (tool msgs)
 
 
+class SwitchingConfig(BaseModel):
+    """Cache-aware, asymmetric switching policy.
+
+    The trained router proposes the best model per turn. But moving OFF the model
+    we are currently on has a real cost: the provider's prompt cache is warm on
+    the current model and cold on any other, so switching re-pays full input
+    price on the (often huge) conversation prefix. That cost is asymmetric:
+
+      - Bump UP (cheap -> dearer): the abandoned cache was cheap; if the turn
+        looks harder, escalate readily. Low resistance.
+      - Bump DOWN (dearer -> cheaper): the current model already has the prefix
+        cached at ~0.1x input; the cheaper model would pay full price cold on the
+        whole prefix, often costing MORE than staying. So resist going down,
+        more so the larger the cached context.
+
+    Implemented as a switch margin the *candidate* must beat the *incumbent* by,
+    in predicted P(success), before we move. Up-margin is small; down-margin
+    grows with cached context size. Heuristic (cache size modeled from token
+    counts, not measured); disabled by default.
+    """
+
+    enabled: bool = False
+    up_margin: float = 0.0      # extra P(success) gain needed to escalate
+    down_margin: float = 0.06   # base extra gain needed to de-escalate
+    # additional down-margin per 100k cached context tokens (stickier when big)
+    down_margin_per_100k: float = 0.04
+    max_down_margin: float = 0.25
+
+
 class PoolConfig(BaseModel):
     routing: RoutingConfig = Field(default_factory=RoutingConfig)
     escalation: EscalationConfig = Field(default_factory=EscalationConfig)
     depth_tolerance: DepthToleranceConfig = Field(default_factory=DepthToleranceConfig)
+    switching: SwitchingConfig = Field(default_factory=SwitchingConfig)
     models: list[ModelSpec] = Field(default_factory=list)
 
     @property

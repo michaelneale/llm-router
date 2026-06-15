@@ -11,6 +11,16 @@ routing:
   encoder: Qwen/Qwen3.5-0.8B
   encoder_backend: transformers
 
+# Cache-aware asymmetric switching: escalate readily (cheap cache to abandon),
+# resist de-escalating off a warm-cached dearer model — more so the bigger the
+# cached context. Keeps the prompt cache alive on big-context agent sessions.
+switching:
+  enabled: true
+  up_margin: 0.0
+  down_margin: 0.06
+  down_margin_per_100k: 0.04
+  max_down_margin: 0.25
+
 models:
   - name: nemotron-3-nano-reasoning
     display_name: GPT-5 Nano
