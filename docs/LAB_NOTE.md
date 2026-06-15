@@ -125,6 +125,36 @@ demo.
 - Capability does not track price on these tasks (gemini-flash > gpt-5-mini), so
   the router routes on predicted success, not tier order — which is correct.
 
+## Personalization attempt (negative result)
+
+Tried to personalize the router on real goose/codex session prompts by
+generating escalation labels with **replay + pairwise judge**: run each prompt
+through cheap/mid/strong tiers, then ask a judge model "is this answer at least
+as good as Opus's?" (`judge_personal.py`). 400 prompts labeled.
+
+It does not work, and not for a fixable reason:
+
+- Without session context the judge sees bare mid-conversation fragments
+  ("anything new there?") and rewards Opus's longer answer → cheap labeled
+  "worse" everywhere. Cheap-as-good-as-Opus: 21%.
+- *Adding* the session-context preamble made it worse (cheap 2%): every prompt
+  now reads as a technical task, and the judge always prefers the more thorough
+  Opus answer.
+- Mixing these labels into the verified full-spectrum set (3x and 10x upweight,
+  retrained) collapsed the cheap end — "reply with done." and "fetch origin
+  main" routed to Opus. Tolerance can't undo it; the distortion is in the
+  predicted P(correct) curve, not the threshold.
+
+Root cause: free-form prompts have **no verifiable outcome**, so any judge
+collapses to "use the biggest model" (it can't tell necessity from thoroughness).
+This is the same label-artifact failure as single-shot plausibility, just
+inverted (flat front → everything-needs-Opus front).
+
+Conclusion: personalization needs *verifiable* labels from your own traffic
+(did the command/test/CI pass, did the diff apply, did the task complete), not
+a judge's preference between answers. The verified-benchmark router is the
+working result. `data/personal-labels.csv` is kept as the record of this.
+
 ## Reproduce
 
 ```bash
