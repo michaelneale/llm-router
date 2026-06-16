@@ -65,6 +65,21 @@ def _model_knob(model: Any, output_token_weight: float) -> dict[str, Any]:
     }
 
 
+def _public_model_ladder(
+    models_with_slots: list[tuple[str, dict[str, Any]]],
+) -> list[dict[str, Any]]:
+    """Collapse trained-slot duplicates into the real provider models users see."""
+    ladder: list[dict[str, Any]] = []
+    seen: set[str] = set()
+    for _, knob in models_with_slots:
+        key = str(knob.get("provider_model") or knob.get("model_id") or "")
+        if key in seen:
+            continue
+        seen.add(key)
+        ladder.append(knob)
+    return ladder
+
+
 def _recommended_tolerances() -> list[dict[str, Any]]:
     return [
         {
@@ -204,7 +219,7 @@ def _build_routing_knobs(
             if utility
             else []
         ),
-        "models": [knob for _, knob in models_with_slots],
+        "models": _public_model_ladder(models_with_slots),
     }
 
 

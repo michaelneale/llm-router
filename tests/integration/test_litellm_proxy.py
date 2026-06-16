@@ -208,6 +208,15 @@ class TestDashboardRoutingKnobs:
 
         cfg = _pool_config()
         cfg.escalation.top_tier_model = "model-b"
+        cfg.models.append(
+            ModelSpec(
+                name="model-c",
+                display_name="Duplicate provider",
+                litellm_model="openrouter/openai/test-b",
+                cost_per_m_input_tokens=1.00,
+                cost_per_m_output_tokens=5.00,
+            )
+        )
 
         knobs = _build_routing_knobs(
             cfg,
@@ -220,6 +229,7 @@ class TestDashboardRoutingKnobs:
             "nvidia_nim/nvidia/test-a",
             "openrouter/openai/test-b",
         ]
+        assert len(public_models) == 2
         assert [m["display_name"] for m in public_models] == [
             "nvidia_nim/nvidia/test-a",
             "openrouter/openai/test-b",
