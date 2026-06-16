@@ -9,6 +9,9 @@ Routing knobs, including env tolerance overrides, the weighted cost ladder,
 switching margins, the top-tier override, and the route log path.
 The tolerance value can be changed live from the dashboard; that updates the
 in-process router default for future requests without editing YAML or restarting.
+Cache pinning can also be changed live from the dashboard. It defaults to off,
+so Goose tool-result / non-decision turns are routed normally instead of blindly
+sticking to the previous model.
 
 ## Main Quality/Cost Knob
 
@@ -130,6 +133,8 @@ switching:
   down_margin: 0.06
   down_margin_per_100k: 0.04
   max_down_margin: 0.25
+  cache_pin_mode: "off"
+  cache_pin_min_blend: 3.0
 ```
 
 This is the cache-aware switching gate:
@@ -139,11 +144,27 @@ This is the cache-aware switching gate:
 - Big cached contexts make down-switching stickier:
   `down_margin_per_100k`.
 
+`cache_pin_mode` is separate from switch gating:
+
+- `off`: route non-decision/tool-result turns normally. This is the default.
+- `dear_only`: preserve the incumbent only when its routing blend is at least
+  `cache_pin_min_blend`.
+- `all`: old behavior; every non-decision turn stays on the incumbent.
+
+The live dashboard buttons call:
+
+```bash
+curl -X POST http://localhost:4000/router/tuning \
+  -H 'Content-Type: application/json' \
+  -d '{"cache_pin_mode":"dear_only"}'
+```
+
 Runtime overrides:
 
 ```bash
 ROUTER_DISABLE_SWITCHING=1 scripts/router-service.sh restart
 ROUTER_DISABLE_SWITCHING=0 scripts/router-service.sh restart
+ROUTER_CACHE_PINNING=dear_only scripts/router-service.sh restart
 ```
 
 ## Per-Request Controls

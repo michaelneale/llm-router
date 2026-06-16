@@ -77,6 +77,10 @@ DASHBOARD_HTML = """<!doctype html>
   button.preset.active { color:var(--green); border-color:#1f6f3f; }
   button.preset .preset-note { display:block; color:var(--muted); font-size:10px;
                                margin-top:1px; }
+  .mode-head { display:flex; align-items:baseline; justify-content:space-between;
+               gap:10px; margin-bottom:8px; }
+  .mode-head strong { font-size:18px; font-weight:600; }
+  .mode-note { color:var(--muted); font-size:12px; }
   table { width:100%; border-collapse:collapse; font-size:12px; }
   th,td { border-top:1px solid var(--line); padding:8px 6px; text-align:left;
           vertical-align:top; }
@@ -191,6 +195,26 @@ async function setTolerance(value){
   }
 }
 
+async function setCachePinning(mode){
+  toleranceSaving = true;
+  $("status").textContent = "updating cache pinning…";
+  try {
+    const r = await fetch("/router/tuning", {
+      method:"POST",
+      headers:{"Content-Type":"application/json"},
+      body:JSON.stringify({cache_pin_mode: mode})
+    });
+    if(!r.ok) throw new Error(await r.text());
+    const d = await r.json();
+    renderKnobs(d.routing_knobs || {});
+    $("status").textContent = "live";
+  } catch(e) {
+    $("status").textContent = "cache pin update failed";
+  } finally {
+    toleranceSaving = false;
+  }
+}
+
 function renderKnobs(k){
   const box = $("knobs");
   if(!k || !Object.keys(k).length){
@@ -203,6 +227,7 @@ function renderKnobs(k){
   }
 
   const sw = k.switching || {};
+  const cache = k.cache_pinning || {};
   const top = k.top_tier || {};
   const override = k.manual_override || "none";
   const tolerance = Number(k.effective_tolerance || 0);
@@ -215,6 +240,13 @@ function renderKnobs(k){
   const switchNote = sw.effective
     ? `up ${Number(sw.up_margin || 0).toFixed(2)} · down ${Number(sw.down_margin || 0).toFixed(2)} + ${Number(sw.down_margin_per_100k || 0).toFixed(2)}/100k`
     : (sw.disabled_by_env ? "disabled by env" : "disabled in config");
+  const cacheMode = cache.mode || "off";
+  const cacheModeLabel = cacheMode === "dear_only" ? "dear only" : cacheMode;
+  const cacheNote = cacheMode === "off"
+    ? "non-decision turns route normally"
+    : (cacheMode === "dear_only"
+      ? `pin if blend ≥ ${Number(cache.min_blend || 0).toFixed(2)}`
+      : "pin every incumbent");
   const models = Array.isArray(k.models) ? k.models : [];
   const presets = Array.isArray(k.recommended_tolerances) ? k.recommended_tolerances : [];
   const presetButtons = presets.map(p => {
@@ -225,6 +257,15 @@ function renderKnobs(k){
       <span class="preset-note">${esc(p.note || "")}</span>
     </button>`;
   }).join("");
+  const cacheButtons = (Array.isArray(cache.recommended_modes) ? cache.recommended_modes : [])
+    .map(p => {
+      const mode = p.mode || "off";
+      const active = mode === cacheMode;
+      return `<button class="preset ${active ? "active" : ""}" data-cache-pin="${esc(mode)}">
+        ${esc(p.label || mode)}
+        <span class="preset-note">${esc(p.note || "")}</span>
+      </button>`;
+    }).join("");
   const rows = models.map(m => `
     <tr>
       <td>
@@ -249,6 +290,16 @@ function renderKnobs(k){
       <div class="tol-scale"><span>quality</span><span>cheaper</span></div>
       <div class="presetrow">${presetButtons}</div>
     </div>
+    <div class="tolerance-panel">
+      <div class="mode-head">
+        <div>
+          <div class="tol-title">Cache pinning</div>
+          <strong>${esc(cacheModeLabel)}</strong>
+        </div>
+        <div class="mode-note">${esc(cacheNote)}</div>
+      </div>
+      <div class="presetrow">${cacheButtons}</div>
+    </div>
     <div class="knob-grid">
       <div class="knob">
         <div class="key">Tolerance</div>
@@ -259,6 +310,11 @@ function renderKnobs(k){
         <div class="key">Cost key</div>
         <div class="value">in + ${Number(k.output_token_weight || 0).toFixed(2)}×out</div>
         <div class="note">sorted cheapest first</div>
+      </div>
+      <div class="knob">
+        <div class="key">Cache pinning</div>
+        <div class="value">${esc(cacheModeLabel)}</div>
+        <div class="note">${esc(cacheNote)}</div>
       </div>
       <div class="knob">
         <div class="key">Switching</div>
@@ -283,6 +339,7 @@ function renderKnobs(k){
     </div>
     <div class="pillrow">
       <span class="pill ${sw.effective ? "on" : "warn"}">switching ${esc(switchState)}</span>
+      <span class="pill ${cacheMode === "off" ? "warn" : "on"}">cache pin ${esc(cacheModeLabel)}</span>
       <span class="pill">pool ${esc((k.pool_config || "").split("/").pop() || "")}</span>
       <span class="pill">proxy ${esc((k.litellm_config || "").split("/").pop() || "")}</span>
     </div>
@@ -299,6 +356,9 @@ function renderKnobs(k){
   }
   document.querySelectorAll("button.preset[data-tolerance]").forEach(btn => {
     btn.onclick = () => setTolerance(btn.dataset.tolerance);
+  });
+  document.querySelectorAll("button.preset[data-cache-pin]").forEach(btn => {
+    btn.onclick = () => setCachePinning(btn.dataset.cachePin);
   });
 }
 

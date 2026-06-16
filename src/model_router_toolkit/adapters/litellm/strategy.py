@@ -37,6 +37,30 @@ _request_tolerance: contextvars.ContextVar[float | None] = contextvars.ContextVa
     default=None,
 )
 
+_CACHE_PIN_ALIASES = {
+    "0": "off",
+    "false": "off",
+    "no": "off",
+    "none": "off",
+    "off": "off",
+    "1": "all",
+    "true": "all",
+    "yes": "all",
+    "on": "all",
+    "all": "all",
+    "dear": "dear_only",
+    "dear_only": "dear_only",
+    "expensive": "dear_only",
+    "expensive_only": "dear_only",
+}
+
+
+def _normalize_cache_pin_mode(value: Any) -> str:
+    mode = _CACHE_PIN_ALIASES.get(str(value or "off").strip().lower())
+    if mode is None:
+        raise ValueError("cache_pin_mode must be one of: off, dear_only, all")
+    return mode
+
 
 class ModelRoutingStrategy:
     """Wraps a BaseRouter and implements the LiteLLM custom routing interface.
@@ -78,6 +102,19 @@ class ModelRoutingStrategy:
         self._depth_tol = depth_tolerance
         # Cache-aware asymmetric switching gate (opt-in).
         self._switching = switching
+        self._cache_pin_mode = _normalize_cache_pin_mode(
+            os.environ.get(
+                "ROUTER_CACHE_PINNING",
+                getattr(switching, "cache_pin_mode", "off") if switching else "off",
+            )
+        )
+        self._cache_pin_min_blend = float(
+            os.environ.get(
+                "ROUTER_CACHE_PIN_MIN_BLEND",
+                getattr(switching, "cache_pin_min_blend", 3.0) if switching else 3.0,
+            )
+            or 0.0
+        )
         # Policy escalation overlay: force the top tier when the prompt matches
         # (sustained agentic loops the prefill encoder can't see, or !hard).
         self._escalation_model = escalation_model
@@ -179,6 +216,22 @@ class ModelRoutingStrategy:
         """Tolerance for the current request: per-request override or default."""
         val = _request_tolerance.get()
         return val if val is not None else self._tolerance
+
+    @property
+    def cache_pin_mode(self) -> str:
+        return self._cache_pin_mode
+
+    @cache_pin_mode.setter
+    def cache_pin_mode(self, value: str) -> None:
+        self._cache_pin_mode = _normalize_cache_pin_mode(value)
+
+    @property
+    def cache_pin_min_blend(self) -> float:
+        return self._cache_pin_min_blend
+
+    @cache_pin_min_blend.setter
+    def cache_pin_min_blend(self, value: float) -> None:
+        self._cache_pin_min_blend = max(0.0, float(value))
 
     @property
     def last_result(self) -> RoutingResult | None:
@@ -342,6 +395,40 @@ class ModelRoutingStrategy:
             return False
         return bool(sw and getattr(sw, "enabled", False))
 
+    def _routing_blend(self, model_name: str) -> float:
+        config = getattr(self._router, "_config", None)
+        if config is not None:
+            spec = config.get_model(model_name) if hasattr(config, "get_model") else None
+            if spec is not None:
+                routing = getattr(config, "routing", None)
+                output_weight = float(
+                    getattr(routing, "output_token_weight", 0.0) or 0.0
+                )
+                multiplier = float(
+                    getattr(spec, "routing_cost_multiplier", 1.0) or 1.0
+                )
+                return (
+                    spec.cost_per_m_input_tokens
+                    + output_weight * spec.cost_per_m_output_tokens
+                ) * multiplier
+
+        resolved = self._router.resolve(model_name)
+        if resolved is None:
+            return 0.0
+        for name, cost in zip(resolved.model_names, resolved.costs):
+            if name == model_name:
+                return cost.cost_per_m_input_tokens + 0.25 * cost.cost_per_m_output_tokens
+        return 0.0
+
+    def _cache_pin_allowed(self, model_name: str) -> tuple[bool, float]:
+        mode = self.cache_pin_mode
+        if mode == "off":
+            return False, self._routing_blend(model_name)
+        if mode == "all":
+            return True, self._routing_blend(model_name)
+        blend = self._routing_blend(model_name)
+        return blend >= self.cache_pin_min_blend, blend
+
     def _log_route(
         self,
         *,
@@ -473,12 +560,17 @@ class ModelRoutingStrategy:
         last_selected = self._get_last_selected(session_key)
         if not last_selected:
             return None
+        allowed, blend = self._cache_pin_allowed(last_selected)
+        if not allowed:
+            return None
         dep = self._find_deployment(last_selected)
         if dep is None:
             return None
         pinned = self._router.resolve(last_selected)
         if pinned is not None:
             pinned.metadata["pin_reason"] = "non_decision_turn"
+            pinned.metadata["cache_pin_mode"] = self.cache_pin_mode
+            pinned.metadata["routing_blend"] = round(float(blend), 6)
             self._store_result(request_id, pinned)
             self._log_route(
                 request_id=request_id,
@@ -549,9 +641,9 @@ class ModelRoutingStrategy:
 
         # Reconstruct a training-shaped task statement from the turn-in-context.
         # Returns None when this turn is NOT a routing decision (tool result or
-        # agent narration). In that case pin to the model we last chose: it keeps
-        # the request on a model that already has the conversation cached, and
-        # avoids scoring machine-noise the classifier was never trained on.
+        # agent narration). By default we still route those turns rather than
+        # blindly pinning to the incumbent; optional cache-pin modes can preserve
+        # the incumbent only for dear models, or for every model.
         raw_text = self._extract_user_text(messages).strip()
         req_models = self._metadata(request_kwargs).get("models")
         allowed = req_models or self._models

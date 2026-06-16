@@ -107,6 +107,12 @@ class SwitchingConfig(BaseModel):
     # additional down-margin per 100k cached context tokens (stickier when big)
     down_margin_per_100k: float = 0.04
     max_down_margin: float = 0.25
+    # Non-decision turns are Goose tool results / narration that do not produce
+    # a fresh task view. Default to routing them normally rather than blindly
+    # preserving the incumbent cache; optional modes can favor cache only for
+    # expensive incumbents, or for every incumbent.
+    cache_pin_mode: str = "off"  # "off", "dear_only", or "all"
+    cache_pin_min_blend: float = 3.0
 
 
 class PoolConfig(BaseModel):

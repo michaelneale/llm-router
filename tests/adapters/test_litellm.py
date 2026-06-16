@@ -416,9 +416,49 @@ models: []
         assert strategy.last_result is not None
         assert strategy.last_result.metadata["pin_reason"] == "goose_info_only"
 
-    def test_goose_info_only_pins_existing_session_model(self):
-        """Once a session has a model, context-refresh turns preserve it."""
+    def test_goose_info_only_default_does_not_pin_existing_session_model(self):
+        """Default mode routes context-refresh turns instead of cache-pinning."""
         strategy = ModelRoutingStrategy(FakeRouter("model-b"), tolerance=0.20)
+        strategy._litellm_router = type(
+            "R",
+            (),
+            {
+                "model_list": [
+                    {"model_name": "model-a", "litellm_params": {"model": "openai/a"}},
+                    {"model_name": "model-b", "litellm_params": {"model": "openai/b"}},
+                ]
+            },
+        )()
+
+        strategy.get_available_deployment(
+            model="test",
+            messages=[{"role": "user", "content": "Fix the failing tests"}],
+            request_kwargs={"metadata": {"router_session_id": "s1"}},
+        )
+        dep = strategy.get_available_deployment(
+            model="test",
+            messages=[
+                {
+                    "role": "user",
+                    "content": (
+                        "<info-msg>\n"
+                        "Working directory: /tmp/repo\n"
+                        "Context: ~7k/128k tokens used (6%)\n"
+                        "</info-msg>"
+                    ),
+                }
+            ],
+            request_kwargs={"metadata": {"router_session_id": "s1"}},
+        )
+
+        assert dep["model_name"] == "model-a"
+        assert strategy.last_result is not None
+        assert strategy.last_result.metadata["pin_reason"] == "goose_info_only"
+
+    def test_goose_info_only_can_pin_existing_session_when_enabled(self):
+        """The old sticky behavior is still available as an explicit mode."""
+        strategy = ModelRoutingStrategy(FakeRouter("model-b"), tolerance=0.20)
+        strategy.cache_pin_mode = "all"
         strategy._litellm_router = type(
             "R",
             (),
@@ -454,3 +494,43 @@ models: []
         assert dep["model_name"] == "model-b"
         assert strategy.last_result is not None
         assert strategy.last_result.metadata["pin_reason"] == "non_decision_turn"
+        assert strategy.last_result.metadata["cache_pin_mode"] == "all"
+
+    def test_dear_only_cache_pin_skips_cheap_incumbent(self):
+        strategy = ModelRoutingStrategy(FakeRouter("model-a"), tolerance=0.20)
+        strategy.cache_pin_mode = "dear_only"
+        strategy.cache_pin_min_blend = 3.0
+        strategy._litellm_router = type(
+            "R",
+            (),
+            {
+                "model_list": [
+                    {"model_name": "model-a", "litellm_params": {"model": "openai/a"}},
+                    {"model_name": "model-b", "litellm_params": {"model": "openai/b"}},
+                ]
+            },
+        )()
+
+        strategy.get_available_deployment(
+            model="test",
+            messages=[{"role": "user", "content": "list files in this directory"}],
+            request_kwargs={"metadata": {"router_session_id": "s1"}},
+        )
+        dep = strategy.get_available_deployment(
+            model="test",
+            messages=[
+                {
+                    "role": "user",
+                    "content": (
+                        "<info-msg>\n"
+                        "Working directory: /tmp/repo\n"
+                        "</info-msg>"
+                    ),
+                }
+            ],
+            request_kwargs={"metadata": {"router_session_id": "s1"}},
+        )
+
+        assert dep["model_name"] == "model-a"
+        assert strategy.last_result is not None
+        assert strategy.last_result.metadata["pin_reason"] == "goose_info_only"

@@ -48,6 +48,8 @@ switching:
   down_margin: 0.06
   down_margin_per_100k: 0.04
   max_down_margin: 0.25
+  cache_pin_mode: "off"
+  cache_pin_min_blend: 3.0
 
 models:
   - name: nemotron-3-nano-reasoning

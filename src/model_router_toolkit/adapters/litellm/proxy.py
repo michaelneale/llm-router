@@ -81,6 +81,26 @@ def _recommended_tolerances() -> list[dict[str, Any]]:
     ]
 
 
+def _cache_pin_modes() -> list[dict[str, Any]]:
+    return [
+        {
+            "label": "Off",
+            "mode": "off",
+            "note": "route non-decision turns",
+        },
+        {
+            "label": "Dear only",
+            "mode": "dear_only",
+            "note": "pin only costly incumbents",
+        },
+        {
+            "label": "All",
+            "mode": "all",
+            "note": "old sticky-cache behavior",
+        },
+    ]
+
+
 def _build_routing_knobs(
     pool: Any,
     *,
@@ -114,6 +134,17 @@ def _build_routing_knobs(
         "ROUTER_SWITCHING"
     )
     switching_configured = bool(getattr(switching, "enabled", False))
+    cache_pin_mode = os.environ.get(
+        "ROUTER_CACHE_PINNING",
+        getattr(switching, "cache_pin_mode", "off") if switching else "off",
+    )
+    cache_pin_min_blend = float(
+        os.environ.get(
+            "ROUTER_CACHE_PIN_MIN_BLEND",
+            getattr(switching, "cache_pin_min_blend", 3.0) if switching else 3.0,
+        )
+        or 0.0
+    )
 
     patterns = (
         list(getattr(escalation, "force_top_tier_when_prompt_matches", []) or [])
@@ -141,6 +172,12 @@ def _build_routing_knobs(
                 getattr(switching, "down_margin_per_100k", 0.0) or 0.0
             ),
             "max_down_margin": float(getattr(switching, "max_down_margin", 0.0) or 0.0),
+        },
+        "cache_pinning": {
+            "mode": str(cache_pin_mode or "off"),
+            "configured_mode": str(cache_pin_mode or "off"),
+            "min_blend": cache_pin_min_blend,
+            "recommended_modes": _cache_pin_modes(),
         },
         "top_tier": by_slot.get(top_slot),
         "manual_override": "!hard" if any("!hard" in p for p in patterns) else "",
@@ -488,6 +525,14 @@ def start_proxy(
         knobs["runtime_tolerance"] = current
         if abs(current - startup) > 1e-9:
             knobs["tolerance_source"] = "runtime"
+        cache_pinning = dict(knobs.get("cache_pinning") or {})
+        cache_pinning["mode"] = getattr(strategy, "cache_pin_mode", "off")
+        cache_pinning["min_blend"] = float(
+            getattr(strategy, "cache_pin_min_blend", cache_pinning.get("min_blend", 3.0))
+            or 0.0
+        )
+        cache_pinning.setdefault("recommended_modes", _cache_pin_modes())
+        knobs["cache_pinning"] = cache_pinning
         return knobs
 
     @litellm_app.get("/savings")
@@ -534,6 +579,27 @@ def start_proxy(
                     status_code=400,
                 )
             strategy.tolerance = tolerance
+
+        cache_pin_mode = body.get("cache_pin_mode")
+        if cache_pin_mode is None and isinstance(body.get("cache_pinning"), dict):
+            cache_pin_mode = body["cache_pinning"].get("mode")
+        if cache_pin_mode is not None:
+            try:
+                strategy.cache_pin_mode = str(cache_pin_mode)
+            except ValueError as exc:
+                return JSONResponse({"error": str(exc)}, status_code=400)
+
+        cache_pin_min_blend = body.get("cache_pin_min_blend")
+        if cache_pin_min_blend is None and isinstance(body.get("cache_pinning"), dict):
+            cache_pin_min_blend = body["cache_pinning"].get("min_blend")
+        if cache_pin_min_blend is not None:
+            try:
+                strategy.cache_pin_min_blend = float(cache_pin_min_blend)
+            except (TypeError, ValueError):
+                return JSONResponse(
+                    {"error": "cache_pin_min_blend must be a number"},
+                    status_code=400,
+                )
 
         return JSONResponse({"routing_knobs": _current_routing_knobs()})
 
