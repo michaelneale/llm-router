@@ -87,8 +87,6 @@ DASHBOARD_HTML = """<!doctype html>
   th { color:var(--muted); font-weight:600; text-transform:uppercase;
        letter-spacing:.04em; font-size:11px; }
   td.num { text-align:right; font-variant-numeric:tabular-nums; white-space:nowrap; }
-  .model-name { font-weight:600; }
-  .model-slot { color:var(--muted); font-size:11px; margin-top:1px; }
   button { background:#21262d; color:var(--fg); border:1px solid var(--line);
            border-radius:8px; padding:9px 16px; font-size:13px; cursor:pointer; }
   button:hover { border-color:var(--accent); color:var(--accent); }
@@ -268,11 +266,7 @@ function renderKnobs(k){
     }).join("");
   const rows = models.map(m => `
     <tr>
-      <td>
-        <div class="model-name">${esc(m.display_name || m.slot)}</div>
-        <div class="model-slot">${esc(m.slot)}</div>
-      </td>
-      <td>${esc(m.litellm_model || "")}</td>
+      <td>${esc(m.provider_model || m.litellm_model || m.model_id || "")}</td>
       <td class="num">${Number(m.input_cost || 0).toFixed(2)} / ${Number(m.output_cost || 0).toFixed(2)}</td>
       <td class="num">${Number(m.routing_blend || 0).toFixed(3)}${Number(m.routing_cost_multiplier || 1) !== 1 ? ` ×${Number(m.routing_cost_multiplier).toFixed(2)}` : ""}</td>
     </tr>`).join("");
@@ -323,8 +317,8 @@ function renderKnobs(k){
       </div>
       <div class="knob">
         <div class="key">Top tier</div>
-        <div class="value">${esc(top.display_name || "none")}</div>
-        <div class="note">${esc(top.litellm_model || "")}</div>
+        <div class="value">${esc(top.display_name || top.provider_model || "none")}</div>
+        <div class="note">${esc(top.provider_model || top.litellm_model || "")}</div>
       </div>
       <div class="knob">
         <div class="key">Manual top</div>
@@ -344,8 +338,8 @@ function renderKnobs(k){
       <span class="pill">proxy ${esc((k.litellm_config || "").split("/").pop() || "")}</span>
     </div>
     <table>
-      <thead><tr><th>Routing ladder</th><th>Provider model</th><th class="num">$/M in / out</th><th class="num">Blend</th></tr></thead>
-      <tbody>${rows || '<tr><td colspan="4" class="muted">No models loaded.</td></tr>'}</tbody>
+      <thead><tr><th>Provider model</th><th class="num">$/M in / out</th><th class="num">Blend</th></tr></thead>
+      <tbody>${rows || '<tr><td colspan="3" class="muted">No models loaded.</td></tr>'}</tbody>
     </table>`;
 
   const slider = $("tol_slider");

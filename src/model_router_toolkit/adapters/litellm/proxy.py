@@ -43,10 +43,19 @@ def _routing_cost_blend(model: Any, output_token_weight: float) -> float:
 
 
 def _model_knob(model: Any, output_token_weight: float) -> dict[str, Any]:
+    internal_name = getattr(model, "name", "")
+    configured_display = getattr(model, "display_name", "")
+    provider_model = getattr(model, "litellm_model", "")
+    display_name = (
+        configured_display
+        if configured_display and configured_display != internal_name
+        else provider_model or configured_display or internal_name
+    )
     return {
-        "slot": getattr(model, "name", ""),
-        "display_name": getattr(model, "display_name", "") or getattr(model, "name", ""),
-        "litellm_model": getattr(model, "litellm_model", ""),
+        "display_name": display_name,
+        "model_id": provider_model or display_name,
+        "provider_model": provider_model,
+        "litellm_model": provider_model,
         "input_cost": float(getattr(model, "cost_per_m_input_tokens", 0.0) or 0.0),
         "output_cost": float(getattr(model, "cost_per_m_output_tokens", 0.0) or 0.0),
         "routing_cost_multiplier": float(
@@ -123,11 +132,19 @@ def _build_routing_knobs(
 
     output_weight = float(getattr(routing, "output_token_weight", 0.0) or 0.0)
     tolerance_source = "env" if env_tolerance not in (None, "") else "config"
-    models = sorted(
-        (_model_knob(model, output_weight) for model in getattr(pool, "models", [])),
-        key=lambda m: (m["routing_blend"], m["input_cost"], m["output_cost"], m["slot"]),
+    models_with_slots = sorted(
+        (
+            (getattr(model, "name", ""), _model_knob(model, output_weight))
+            for model in getattr(pool, "models", [])
+        ),
+        key=lambda item: (
+            item[1]["routing_blend"],
+            item[1]["input_cost"],
+            item[1]["output_cost"],
+            item[0],
+        ),
     )
-    by_slot = {m["slot"]: m for m in models}
+    by_slot = {slot: knob for slot, knob in models_with_slots}
     top_slot = getattr(escalation, "top_tier_model", "") if escalation else ""
 
     switching_disabled = _env_truthy("ROUTER_DISABLE_SWITCHING") or _env_falsey(
@@ -187,7 +204,7 @@ def _build_routing_knobs(
             if utility
             else []
         ),
-        "models": models,
+        "models": [knob for _, knob in models_with_slots],
     }
 
 

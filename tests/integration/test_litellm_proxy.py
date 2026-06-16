@@ -198,6 +198,38 @@ class TestValidateModelAlignment:
 
 
 # ---------------------------------------------------------------------------
+# Dashboard / tuning metadata
+# ---------------------------------------------------------------------------
+
+
+class TestDashboardRoutingKnobs:
+    def test_public_model_ladder_uses_provider_models_not_slots(self):
+        from model_router_toolkit.adapters.litellm.proxy import _build_routing_knobs
+
+        cfg = _pool_config()
+        cfg.escalation.top_tier_model = "model-b"
+
+        knobs = _build_routing_knobs(
+            cfg,
+            router_config="pool.yaml",
+            litellm_config="litellm.yaml",
+        )
+
+        public_models = knobs["models"]
+        assert [m["provider_model"] for m in public_models] == [
+            "nvidia_nim/nvidia/test-a",
+            "openrouter/openai/test-b",
+        ]
+        assert [m["display_name"] for m in public_models] == [
+            "nvidia_nim/nvidia/test-a",
+            "openrouter/openai/test-b",
+        ]
+        assert all("slot" not in m for m in public_models)
+        assert knobs["top_tier"]["provider_model"] == "openrouter/openai/test-b"
+        assert "slot" not in knobs["top_tier"]
+
+
+# ---------------------------------------------------------------------------
 # Strategy injection
 # ---------------------------------------------------------------------------
 
