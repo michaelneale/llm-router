@@ -97,7 +97,7 @@ calibration was learned for the checkpoint slot, not for every later remap.
 
 Current aggressive test:
 
-- top forced slot: `openai/gpt-5.5`
+- top forced slot: `anthropic/claude-opus-4-8`
 - high automatic slot: `openai/gpt-5.4-mini`
 
 ## Starting Cheap
@@ -122,7 +122,7 @@ escalation:
 ```
 
 `!hard` is the only explicit manual override in the current setup. It routes the
-turn to the top slot, currently `openai/gpt-5.5`.
+turn to the top slot, currently `anthropic/claude-opus-4-8`.
 
 ## Going Down Vs Up
 

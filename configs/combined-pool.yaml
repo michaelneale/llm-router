@@ -1,4 +1,4 @@
-# Verified-trace router pool, remapped for a GPT-5.5 frontier baseline.
+# Verified-trace router pool, remapped for a Claude Opus 4.8 frontier baseline.
 #
 # The checkpoint was trained from public verified multi-model success matrices,
 # then mapped onto the callable Anthropic/OpenAI models below:
@@ -8,7 +8,7 @@
 #
 # Important: `name` is the checkpoint slot and must not change without retraining.
 # `display_name` / `litellm_model` are the current provider models we serve in
-# that slot. This aggressive pool uses GPT-5.5 as the only frontier/top
+# that slot. This aggressive pool uses Claude Opus 4.8 as the frontier/top
 # escalation slot, caps the high automatic slot at GPT-5.4 Mini, and uses GPT
 # mini/nano variants plus Haiku/Sonnet below that. The current trial tolerance is
 # 0.145: a high-savings local replay point with about 3.9pp public verified-label
@@ -88,7 +88,7 @@ models:
     cost_per_m_input_tokens: 0.75
     cost_per_m_output_tokens: 4.50
   - name: claude-opus-4-6-high
-    display_name: GPT-5.5
-    litellm_model: openai/gpt-5.5
+    display_name: Claude Opus 4.8
+    litellm_model: anthropic/claude-opus-4-8
     cost_per_m_input_tokens: 5.00
-    cost_per_m_output_tokens: 30.00
+    cost_per_m_output_tokens: 25.00
