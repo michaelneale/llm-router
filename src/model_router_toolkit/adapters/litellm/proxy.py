@@ -134,6 +134,7 @@ def _build_routing_knobs(
     routing = getattr(pool, "routing", None)
     switching = getattr(pool, "switching", None)
     escalation = getattr(pool, "escalation", None)
+    session_health = getattr(pool, "session_health", None)
     utility = getattr(pool, "utility", None)
 
     configured_tolerance = float(getattr(routing, "tolerance", 0.0) or 0.0)
@@ -213,6 +214,26 @@ def _build_routing_knobs(
         },
         "top_tier": by_slot.get(top_slot),
         "manual_override": "!hard" if any("!hard" in p for p in patterns) else "",
+        "session_health": {
+            "configured": bool(
+                session_health and getattr(session_health, "enabled", False)
+            ),
+            "checkpoint": (
+                str(getattr(session_health, "checkpoint", "")) if session_health else ""
+            ),
+            "threshold": float(
+                os.environ.get(
+                    "ROUTER_SESSION_HEALTH_THRESHOLD",
+                    getattr(session_health, "threshold", 0.0) if session_health else 0.0,
+                )
+                or 0.0
+            ),
+            "top_tier_model": (
+                getattr(session_health, "top_tier_model", "") if session_health else ""
+            ),
+            "disabled_by_env": os.environ.get("ROUTER_SESSION_HEALTH", "").lower()
+            in {"0", "false", "no", "off"},
+        },
         "escalation_patterns": patterns,
         "cheap_patterns": (
             list(getattr(utility, "cheap_when_prompt_matches", []) or [])

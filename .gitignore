@@ -55,6 +55,7 @@ data/
 # Trained router checkpoints (large binaries; personal/benchmark-specific).
 # Regenerate with `model-router train` or distribute out-of-band (see README).
 checkpoints/*.pt
+checkpoints/*.pkl
 
 # Generated LiteLLM config (derived from goose-mix.yaml via config_bridge).
 # Regenerate with `model-router generate-litellm-config`; uncomment to ignore.

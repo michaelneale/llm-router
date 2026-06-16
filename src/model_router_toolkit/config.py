@@ -51,6 +51,20 @@ class EscalationConfig(BaseModel):
     top_tier_model: str = ""
 
 
+class SessionHealthConfig(BaseModel):
+    """Learned trajectory-health escalation.
+
+    This is intentionally separate from the normal model-correctness router. It
+    predicts whether the recent session state is deteriorating; if it fires, the
+    LiteLLM strategy escalates to the configured top tier.
+    """
+
+    enabled: bool = False
+    checkpoint: str = ""
+    threshold: float = 0.75
+    top_tier_model: str = ""
+
+
 class UtilityConfig(BaseModel):
     """Cheap-route overlay for obvious utility prompts.
 
@@ -118,6 +132,7 @@ class SwitchingConfig(BaseModel):
 class PoolConfig(BaseModel):
     routing: RoutingConfig = Field(default_factory=RoutingConfig)
     escalation: EscalationConfig = Field(default_factory=EscalationConfig)
+    session_health: SessionHealthConfig = Field(default_factory=SessionHealthConfig)
     utility: UtilityConfig = Field(default_factory=UtilityConfig)
     depth_tolerance: DepthToleranceConfig = Field(default_factory=DepthToleranceConfig)
     switching: SwitchingConfig = Field(default_factory=SwitchingConfig)

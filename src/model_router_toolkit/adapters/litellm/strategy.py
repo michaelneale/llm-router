@@ -83,6 +83,7 @@ class ModelRoutingStrategy:
         cheap_patterns: list[str] | None = None,
         depth_tolerance: Any = None,
         switching: Any = None,
+        session_health: Any = None,
     ):
         import re as _re
 
@@ -102,6 +103,21 @@ class ModelRoutingStrategy:
         self._depth_tol = depth_tolerance
         # Cache-aware asymmetric switching gate (opt-in).
         self._switching = switching
+        self._session_health_config = session_health
+        self._session_health_scorer: Any = None
+        self._session_health_threshold = float(
+            os.environ.get(
+                "ROUTER_SESSION_HEALTH_THRESHOLD",
+                getattr(session_health, "threshold", 0.75) if session_health else 0.75,
+            )
+            or 0.75
+        )
+        if self._session_health_enabled():
+            checkpoint = getattr(session_health, "checkpoint", "") if session_health else ""
+            if checkpoint:
+                from model_router_toolkit.session_health import SessionHealthScorer
+
+                self._session_health_scorer = SessionHealthScorer.load(checkpoint)
         self._cache_pin_mode = _normalize_cache_pin_mode(
             os.environ.get(
                 "ROUTER_CACHE_PINNING",
@@ -151,6 +167,7 @@ class ModelRoutingStrategy:
         kwargs.setdefault("cheap_patterns", utility.cheap_when_prompt_matches)
         kwargs.setdefault("depth_tolerance", config.depth_tolerance)
         kwargs.setdefault("switching", getattr(config, "switching", None))
+        kwargs.setdefault("session_health", getattr(config, "session_health", None))
         return cls(router, **kwargs)
 
     def _escalates(self, text: str) -> bool:
@@ -289,6 +306,72 @@ class ModelRoutingStrategy:
         if not candidates:
             return None
         return min(candidates)[2]
+
+    def _dearest_model(self, allowed: list[str] | None = None) -> str | None:
+        allowed_set = set(allowed) if allowed else None
+        candidates: list[tuple[float, float, str]] = []
+        for name in self._pool_model_names():
+            if allowed_set is not None and name not in allowed_set:
+                continue
+            result = self._router.resolve(name)
+            if result is None:
+                continue
+            cost = result.selected_cost
+            candidates.append(
+                (cost.cost_per_m_input_tokens, cost.cost_per_m_output_tokens, name)
+            )
+        if not candidates:
+            return None
+        return max(candidates)[2]
+
+    def _session_health_enabled(self) -> bool:
+        if os.environ.get("ROUTER_SESSION_HEALTH", "").lower() in {
+            "0",
+            "false",
+            "no",
+            "off",
+        }:
+            return False
+        if os.environ.get("ROUTER_SESSION_HEALTH", "").lower() in {
+            "1",
+            "true",
+            "yes",
+            "on",
+        }:
+            return True
+        return bool(
+            self._session_health_config
+            and getattr(self._session_health_config, "enabled", False)
+        )
+
+    def _session_health_top_model(self, allowed: list[str] | None = None) -> str | None:
+        configured = (
+            getattr(self._session_health_config, "top_tier_model", "")
+            if self._session_health_config
+            else ""
+        )
+        configured = configured or self._escalation_model
+        if configured and (not allowed or configured in set(allowed)):
+            return configured
+        return self._dearest_model(allowed)
+
+    def _score_session_health(
+        self,
+        messages: list[dict] | None,
+        *,
+        task: str,
+    ) -> Any | None:
+        scorer = self._session_health_scorer
+        if scorer is None:
+            return None
+        try:
+            score = scorer.score_messages(messages, task=task)
+        except Exception:
+            logger.exception("Session-health scoring failed")
+            return None
+        score.threshold = self._session_health_threshold
+        score.should_escalate = score.score >= self._session_health_threshold
+        return score
 
     def _select_utility_model(
         self,
@@ -726,6 +809,52 @@ class ModelRoutingStrategy:
                 logger.info("Escalation policy -> %s", self._escalation_model)
                 return dep
 
+        health = self._score_session_health(messages, task=text)
+        if health is not None and health.should_escalate:
+            model_name = self._session_health_top_model(allowed)
+            dep = self._find_deployment(model_name) if model_name else None
+            if dep:
+                result = self._router.resolve(model_name)
+                if result is None:
+                    return dep
+                result.metadata["escalated"] = True
+                result.metadata["session_health"] = {
+                    "score": round(float(health.score), 4),
+                    "threshold": round(float(health.threshold), 4),
+                    "features": {
+                        k: round(float(v), 4) for k, v in health.features.items()
+                    },
+                }
+                self._set_last_selected(session_key, model_name)
+                self._store_result(request_id, result)
+                self._log_route(
+                    request_id=request_id,
+                    session_key=session_key,
+                    decision="session_health_escalation",
+                    result=result,
+                    task_view=text,
+                    messages=messages,
+                    extra={
+                        "session_health_score": round(float(health.score), 4),
+                        "session_health_threshold": round(float(health.threshold), 4),
+                        "allowed_models": allowed,
+                    },
+                )
+                logger.info(
+                    "Session-health escalation %.3f >= %.3f -> %s",
+                    health.score,
+                    health.threshold,
+                    model_name,
+                )
+                return dep
+
+        health_extra = {}
+        if health is not None:
+            health_extra = {
+                "session_health_score": round(float(health.score), 4),
+                "session_health_threshold": round(float(health.threshold), 4),
+            }
+
         tol = self._depth_scaled_tolerance(self.effective_tolerance, messages)
         result = self._router.route(
             text,
@@ -747,6 +876,7 @@ class ModelRoutingStrategy:
                 "raw_selected_model": raw_selected,
                 "tolerance": tol,
                 "allowed_models": allowed,
+                **health_extra,
             },
         )
 

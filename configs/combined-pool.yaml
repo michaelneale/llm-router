@@ -29,6 +29,12 @@ escalation:
   force_top_tier_when_prompt_matches:
     - "(^|\\s)!hard\\b"
 
+session_health:
+  enabled: true
+  checkpoint: checkpoints/session_health_public.pkl
+  threshold: 0.90
+  top_tier_model: claude-opus-4-6-high
+
 # Cold-session utility overlay: route obviously-simple requests to the cheapest
 # callable model instead of spending a classifier high-tier pick. Once a session
 # has an incumbent model, cache-preserving pin/switch logic is allowed to govern.
