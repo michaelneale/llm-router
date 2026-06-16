@@ -25,7 +25,13 @@ The core insight: lightweight models can handle a substantial set of queries cor
 > OpenAI-compatible proxy. It also ships a **live savings dashboard** so you can
 > watch the cost reduction in real time as you work.
 
-![LLM Router live savings dashboard](docs/img/savings-dashboard.png)
+<p>
+  <img src="docs/img/router-dashboard-overview.jpg" alt="LLM Router live savings dashboard showing cost saved, runtime tolerance, cache pinning, and top tier controls">
+</p>
+
+<p>
+  <img src="docs/img/router-dashboard-models.jpg" alt="LLM Router dashboard showing provider model ladder and routing distribution">
+</p>
 
 *The `/dashboard` endpoint: real-time % saved vs. a frontier baseline, routing
 distribution across tiers, and a resettable counter — populated from your actual
