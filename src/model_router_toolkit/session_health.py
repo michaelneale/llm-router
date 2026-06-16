@@ -28,6 +28,44 @@ ERROR_RE = re.compile(
     r")\b",
     re.I,
 )
+TEST_COMMAND_RE = re.compile(
+    r"\b(pytest|tox|npm\s+test|yarn\s+test|pnpm\s+test|cargo\s+test|go\s+test|"
+    r"mvn\s+test|gradle\s+test|runtests?\.py|unittest|nosetests|rspec|jest|vitest)\b",
+    re.I,
+)
+TEST_FAILURE_RE = re.compile(
+    r"\b("
+    r"failed\b|failures?\b|assertionerror|error collecting|tests?\s+failed|"
+    r"\d+\s+failed|\d+\s+errors?|not ok\b"
+    r")\b",
+    re.I,
+)
+TIMEOUT_RE = re.compile(r"\b(timeout|timed out|time limit|deadline exceeded|killed)\b", re.I)
+MISSING_DEP_RE = re.compile(
+    r"\b("
+    r"no module named|modulenotfounderror|importerror|cannot find module|"
+    r"module not found|command not found|no such file|package not found"
+    r")\b",
+    re.I,
+)
+PARSE_ERROR_RE = re.compile(r"parse[_ -]?error|\"parse_error\"\s*:\s*(?!null)", re.I)
+PATCH_RE = re.compile(
+    r"\b(apply_patch|diff --git|git apply|edit_file|write_file|write_text|"
+    r"sed\s+-i|perl\s+-pi|cat\s+>|tee\s+[^|\s>]+|patch\.txt)\b|"
+    r"^@@|^\+\+\+ b/|^--- a/",
+    re.I | re.M,
+)
+FILE_RE = re.compile(
+    r"(?:^|[\s\"'`])(?:[ab]/)?([\w./-]+\."
+    r"(?:py|js|ts|tsx|jsx|rs|go|java|rb|php|c|cc|cpp|h|hpp|swift|kt|scala|cs|"
+    r"md|rst|toml|yaml|yml|json|ini|cfg|txt|sh|sql))\b",
+    re.I,
+)
+DIFF_FILE_RE = re.compile(r"diff --git a/([^\s]+) b/([^\s]+)", re.I)
+COMMAND_VALUE_RE = re.compile(
+    r"[\"'](?:command|cmd)[\"']\s*:\s*([\"'])(.{1,1200}?)\1",
+    re.I,
+)
 SUCCESS_RE = re.compile(
     r"\b(exit code:\s*0|all tests? passed|passed\b|success(?:ful|fully)?|done)\b",
     re.I,
@@ -60,6 +98,27 @@ NUMERIC_FEATURES = [
     "avg_chars_recent",
     "tool_fraction",
     "late_fraction",
+    "command_count",
+    "command_recent",
+    "test_command_recent",
+    "repeated_command_recent",
+    "repeated_failing_command_recent",
+    "repeated_test_command_recent",
+    "test_failure_count",
+    "test_failure_recent",
+    "patch_count",
+    "patch_recent",
+    "edit_after_error_recent",
+    "same_error_after_patch_recent",
+    "test_failure_after_patch_recent",
+    "same_file_edit_recent",
+    "timeout_count",
+    "timeout_recent",
+    "missing_dependency_count",
+    "missing_dependency_recent",
+    "parse_error_count",
+    "parse_error_recent",
+    "recovery_after_error_recent",
 ]
 
 
@@ -111,16 +170,66 @@ def _event(role: str, text: Any, *, is_tool: bool = False, error: Any = None) ->
     )
 
 
+def iter_tool_calls(tool_calls: Any) -> list[Any]:
+    if not tool_calls:
+        return []
+    return tool_calls if isinstance(tool_calls, list) else [tool_calls]
+
+
+def tool_call_parse_errors(tool_calls: Any) -> list[Any]:
+    return [
+        call.get("parse_error")
+        for call in iter_tool_calls(tool_calls)
+        if isinstance(call, dict) and call.get("parse_error") not in (None, "", False)
+    ]
+
+
+def tool_calls_text(tool_calls: Any) -> str:
+    calls = iter_tool_calls(tool_calls)
+    if not calls:
+        return ""
+    parts: list[str] = []
+    for call in calls:
+        if not isinstance(call, dict):
+            parts.append(f"tool_call: {clean_text(call, max_chars=800)}")
+            continue
+        function = call.get("function")
+        if isinstance(function, dict):
+            name = function.get("name")
+            arguments = function.get("arguments")
+            if name:
+                parts.append(f"tool_function: {clean_text(name, max_chars=100)}")
+            if arguments:
+                parts.append(f"tool_arguments: {clean_text(arguments, max_chars=1000)}")
+        elif function:
+            parts.append(f"tool_function: {clean_text(function, max_chars=100)}")
+        arguments = call.get("arguments")
+        if arguments:
+            parts.append(f"tool_arguments: {clean_text(arguments, max_chars=1000)}")
+        view = call.get("view")
+        if isinstance(view, dict) and view.get("content"):
+            parts.append(f"tool_view: {clean_text(view.get('content'), max_chars=1000)}")
+        parse_error = call.get("parse_error")
+        if parse_error not in (None, "", False):
+            parts.append(f"tool_parse_error: {clean_text(parse_error, max_chars=500)}")
+    return "\n".join(parts)
+
+
 def events_from_swe_messages(messages: list[dict[str, Any]]) -> list[TraceEvent]:
     events: list[TraceEvent] = []
     for msg in messages:
         role = str(msg.get("role") or "unknown")
+        text = content_text(msg.get("content", ""))
+        calls_text = tool_calls_text(msg.get("tool_calls"))
+        if calls_text:
+            text = f"{text}\n{calls_text}" if text else calls_text
+        parse_errors = tool_call_parse_errors(msg.get("tool_calls"))
         events.append(
             _event(
                 role,
-                msg.get("content", ""),
+                text,
                 is_tool=role == "tool" or bool(msg.get("tool_call_id")),
-                error=msg.get("error"),
+                error=parse_errors or msg.get("error"),
             )
         )
     return [e for e in events if e.text]
@@ -171,9 +280,77 @@ def events_from_openai_messages(messages: list[dict[str, Any]] | None) -> list[T
         is_tool = role in {"tool", "function"} or bool(msg.get("tool_call_id"))
         text = content_text(msg.get("content", ""))
         if msg.get("tool_calls"):
-            text = f"{text}\nTool calls: {clean_text(msg.get('tool_calls'), max_chars=700)}"
-        events.append(_event(role, text, is_tool=is_tool))
+            text = f"{text}\n{tool_calls_text(msg.get('tool_calls'))}"
+        events.append(
+            _event(
+                role,
+                text,
+                is_tool=is_tool,
+                error=tool_call_parse_errors(msg.get("tool_calls")),
+            )
+        )
     return [e for e in events if e.text]
+
+
+def _shell_lines(text: str) -> list[str]:
+    text = text.replace("\\n", "\n")
+    lines: list[str] = []
+    for raw in text.splitlines():
+        line = raw.strip()
+        if not line or line.startswith("#"):
+            continue
+        if line.startswith("$ "):
+            line = line[2:].strip()
+        lines.append(line)
+    return lines
+
+
+def normalize_command(command: str) -> str:
+    command = clean_text(command.replace("\\n", " "), max_chars=500).lower()
+    command = re.sub(r"\bcd\s+/\S+\s*(?:&&|;)\s*", "", command)
+    command = re.sub(r"\b(?:python3?|/opt/miniconda3/bin/python)\b", "python", command)
+    command = re.sub(r"\s+", " ", command).strip()
+    return command[:220]
+
+
+def extract_commands(text: str) -> list[str]:
+    commands: list[str] = []
+    for block in COMMAND_RE.findall(text or ""):
+        commands.extend(normalize_command(line) for line in _shell_lines(block))
+    for _, value in COMMAND_VALUE_RE.findall(text or ""):
+        commands.extend(normalize_command(line) for line in _shell_lines(value))
+    deduped: list[str] = []
+    seen: set[str] = set()
+    for command in commands:
+        if command and command not in seen:
+            seen.add(command)
+            deduped.append(command)
+    return deduped
+
+
+def extract_files(text: str) -> list[str]:
+    files: set[str] = set()
+    for left, right in DIFF_FILE_RE.findall(text or ""):
+        files.add(right or left)
+    for file_name in FILE_RE.findall(text or ""):
+        files.add(file_name.removeprefix("a/").removeprefix("b/"))
+    return sorted(files)
+
+
+def is_test_command(command: str) -> bool:
+    return bool(TEST_COMMAND_RE.search(command))
+
+
+def is_patch_event(text: str, commands: list[str], files: list[str]) -> bool:
+    if PATCH_RE.search(text or ""):
+        return True
+    if any(PATCH_RE.search(command) for command in commands):
+        return True
+    return bool(files and any(command.startswith(("sed -i", "perl -pi")) for command in commands))
+
+
+def _operational_error(index: int, event: TraceEvent) -> bool:
+    return bool(event.has_error and not (index == 0 and event.role == "user"))
 
 
 def error_signature(text: str) -> str:
@@ -195,8 +372,11 @@ def health_features(events: list[TraceEvent], idx: int | None = None) -> dict[st
     idx = max(0, min(idx, len(events) - 1))
     prefix = events[: idx + 1]
     recent = prefix[-8:]
-    errors = [e for e in prefix if e.has_error]
-    recent_errors = [e for e in recent if e.has_error]
+    errors = [e for i, e in enumerate(prefix) if _operational_error(i, e)]
+    recent_start = len(prefix) - len(recent)
+    recent_errors = [
+        e for i, e in enumerate(recent, start=recent_start) if _operational_error(i, e)
+    ]
     successes = [e for e in prefix if e.has_success]
     recent_successes = [e for e in recent if e.has_success]
     retries = [e for e in prefix if RETRY_RE.search(e.text)]
@@ -207,13 +387,88 @@ def health_features(events: list[TraceEvent], idx: int | None = None) -> dict[st
         sig_counts[sig] = sig_counts.get(sig, 0) + 1
     repeated = sum(max(0, c - 1) for c in sig_counts.values())
     tail = 0
-    for e in reversed(prefix):
-        if not e.has_error:
+    for i in range(len(prefix) - 1, -1, -1):
+        if not _operational_error(i, prefix[i]):
             break
         tail += 1
     chars_recent = sum(len(e.text) for e in recent)
     event_count = len(prefix)
     tool_count = sum(1 for e in prefix if e.is_tool)
+    event_infos: list[dict[str, Any]] = []
+    last_commands: list[str] = []
+    for i, event in enumerate(prefix):
+        commands = extract_commands(event.text)
+        active_commands = commands or last_commands
+        files = extract_files(event.text)
+        has_error = _operational_error(i, event)
+        test_command = any(is_test_command(command) for command in commands)
+        failed_commands = active_commands[-3:] if has_error and active_commands else []
+        has_test_failure = bool(TEST_FAILURE_RE.search(event.text)) or bool(
+            has_error and any(is_test_command(command) for command in active_commands)
+        )
+        info = {
+            "commands": commands,
+            "failed_commands": failed_commands,
+            "files": files,
+            "has_error": has_error,
+            "has_success": event.has_success,
+            "is_patch": is_patch_event(event.text, commands, files),
+            "has_test_command": test_command,
+            "has_test_failure": has_test_failure,
+            "has_timeout": bool(TIMEOUT_RE.search(event.text)),
+            "has_missing_dependency": bool(MISSING_DEP_RE.search(event.text)),
+            "has_parse_error": bool(PARSE_ERROR_RE.search(event.text)),
+            "error_sig": error_signature(event.text) if has_error else "",
+        }
+        event_infos.append(info)
+        if commands:
+            last_commands = commands
+    recent_infos = event_infos[-8:]
+
+    def repeated_count(values: list[str]) -> float:
+        counts: dict[str, int] = {}
+        for value in values:
+            counts[value] = counts.get(value, 0) + 1
+        return float(sum(max(0, count - 1) for count in counts.values()))
+
+    recent_commands = [
+        command for info in recent_infos for command in info["commands"] if command
+    ]
+    recent_failed_commands = [
+        command for info in recent_infos for command in info["failed_commands"] if command
+    ]
+    recent_test_commands = [command for command in recent_commands if is_test_command(command)]
+    recent_patch_files = [
+        file_name for info in recent_infos if info["is_patch"] for file_name in info["files"]
+    ]
+    same_error_after_patch = 0
+    last_error_index: dict[str, int] = {}
+    for i, info in enumerate(recent_infos):
+        sig = info["error_sig"]
+        if not sig:
+            continue
+        prev = last_error_index.get(sig)
+        if prev is not None and any(item["is_patch"] for item in recent_infos[prev + 1 : i]):
+            same_error_after_patch += 1
+        last_error_index[sig] = i
+    seen_error = False
+    edit_after_error = 0
+    test_failure_after_patch = 0
+    seen_patch = False
+    recovery_after_error = 0
+    for info in recent_infos:
+        if info["is_patch"] and seen_error:
+            edit_after_error += 1
+        if info["has_test_failure"] and seen_patch:
+            test_failure_after_patch += 1
+        if info["has_success"] and seen_error:
+            recovery_after_error += 1
+        if info["has_error"]:
+            seen_error = True
+        if info["is_patch"]:
+            seen_patch = True
+    last_idx = len(prefix) - 1
+    last_event_error = _operational_error(last_idx, prefix[-1])
     return {
         "event_count": float(event_count),
         "assistant_count": float(sum(1 for e in prefix if e.role == "assistant" or e.role == "agent")),
@@ -229,17 +484,46 @@ def health_features(events: list[TraceEvent], idx: int | None = None) -> dict[st
         "retry_recent": float(len(recent_retries)),
         "repeated_error_recent": float(repeated),
         "consecutive_error_tail": float(tail),
-        "last_event_error": float(prefix[-1].has_error),
-        "last_tool_error": float(bool(prefix[-1].is_tool and prefix[-1].has_error)),
+        "last_event_error": float(last_event_error),
+        "last_tool_error": float(bool(prefix[-1].is_tool and last_event_error)),
         "chars_recent": float(chars_recent),
         "avg_chars_recent": chars_recent / max(1.0, len(recent)),
         "tool_fraction": tool_count / max(1.0, event_count),
         "late_fraction": idx / max(1.0, len(events) - 1),
+        "command_count": float(sum(len(info["commands"]) for info in event_infos)),
+        "command_recent": float(len(recent_commands)),
+        "test_command_recent": float(sum(1 for info in recent_infos if info["has_test_command"])),
+        "repeated_command_recent": repeated_count(recent_commands),
+        "repeated_failing_command_recent": repeated_count(recent_failed_commands),
+        "repeated_test_command_recent": repeated_count(recent_test_commands),
+        "test_failure_count": float(sum(1 for info in event_infos if info["has_test_failure"])),
+        "test_failure_recent": float(sum(1 for info in recent_infos if info["has_test_failure"])),
+        "patch_count": float(sum(1 for info in event_infos if info["is_patch"])),
+        "patch_recent": float(sum(1 for info in recent_infos if info["is_patch"])),
+        "edit_after_error_recent": float(edit_after_error),
+        "same_error_after_patch_recent": float(same_error_after_patch),
+        "test_failure_after_patch_recent": float(test_failure_after_patch),
+        "same_file_edit_recent": repeated_count(recent_patch_files),
+        "timeout_count": float(sum(1 for info in event_infos if info["has_timeout"])),
+        "timeout_recent": float(sum(1 for info in recent_infos if info["has_timeout"])),
+        "missing_dependency_count": float(
+            sum(1 for info in event_infos if info["has_missing_dependency"])
+        ),
+        "missing_dependency_recent": float(
+            sum(1 for info in recent_infos if info["has_missing_dependency"])
+        ),
+        "parse_error_count": float(sum(1 for info in event_infos if info["has_parse_error"])),
+        "parse_error_recent": float(sum(1 for info in recent_infos if info["has_parse_error"])),
+        "recovery_after_error_recent": float(recovery_after_error),
     }
 
 
-def feature_vector(features: dict[str, float]) -> list[float]:
-    return [float(features.get(name, 0.0) or 0.0) for name in NUMERIC_FEATURES]
+def feature_vector(
+    features: dict[str, float],
+    names: list[str] | tuple[str, ...] | None = None,
+) -> list[float]:
+    feature_names = names or NUMERIC_FEATURES
+    return [float(features.get(name, 0.0) or 0.0) for name in feature_names]
 
 
 def window_text(
@@ -257,12 +541,12 @@ def window_text(
     parts: list[str] = []
     if task:
         parts.append("Task: " + clean_text(task, max_chars=1200))
-    for e in recent:
+    for absolute_idx, e in enumerate(recent, start=max(0, idx + 1 - max_events)):
         tag = e.role
         if e.is_tool:
             tag = f"{tag}/tool"
         flags = []
-        if e.has_error:
+        if _operational_error(absolute_idx, e):
             flags.append("error")
         if e.has_success:
             flags.append("success")
@@ -280,8 +564,14 @@ def heuristic_badness(features: dict[str, float]) -> float:
     score += 0.8 * features.get("last_event_error", 0.0)
     score += 0.8 * features.get("last_tool_error", 0.0)
     score += 0.5 * min(4.0, features.get("retry_recent", 0.0))
+    score += 1.0 * min(2.0, features.get("repeated_failing_command_recent", 0.0))
+    score += 0.9 * min(2.0, features.get("same_error_after_patch_recent", 0.0))
+    score += 0.7 * min(3.0, features.get("test_failure_after_patch_recent", 0.0))
+    score += 0.5 * min(3.0, features.get("edit_after_error_recent", 0.0))
+    score += 0.6 * min(2.0, features.get("timeout_recent", 0.0))
     score += 0.03 * min(80.0, features.get("event_count", 0.0))
     score -= 0.9 * min(2.0, features.get("success_recent", 0.0))
+    score -= 0.8 * min(2.0, features.get("recovery_after_error_recent", 0.0))
     return score
 
 
@@ -353,6 +643,7 @@ class SessionHealthScorer:
         self.scaler = checkpoint["scaler"]
         self.classifier = checkpoint["classifier"]
         self.threshold = float(checkpoint.get("threshold", 0.75))
+        self.numeric_features = list(checkpoint.get("numeric_features") or NUMERIC_FEATURES)
 
     @classmethod
     def load(cls, path: str | Path) -> "SessionHealthScorer":
@@ -363,7 +654,9 @@ class SessionHealthScorer:
         from scipy.sparse import hstack
 
         x_text = self.vectorizer.transform([text])
-        x_num = self.scaler.transform(np.asarray([feature_vector(features)], dtype=float))
+        x_num = self.scaler.transform(
+            np.asarray([feature_vector(features, self.numeric_features)], dtype=float)
+        )
         x = hstack([x_text, x_num])
         if hasattr(self.classifier, "predict_proba"):
             return float(self.classifier.predict_proba(x)[0, 1])
@@ -382,6 +675,10 @@ class SessionHealthScorer:
             window_text=text,
         )
 
-    def score_messages(self, messages: list[dict[str, Any]] | None, *, task: str = "") -> SessionHealthScore:
+    def score_messages(
+        self,
+        messages: list[dict[str, Any]] | None,
+        *,
+        task: str = "",
+    ) -> SessionHealthScore:
         return self.score_events(events_from_openai_messages(messages), task=task)
-

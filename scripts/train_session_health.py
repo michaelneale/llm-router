@@ -31,10 +31,13 @@ def load_rows(path: str) -> list[dict]:
         rows = list(csv.DictReader(f))
     if not rows:
         raise SystemExit(f"no rows in {path}")
-    required = {"task_id", "window_text", "bad_next", *NUMERIC_FEATURES}
+    required = {"task_id", "window_text", "bad_next"}
     missing = required - set(rows[0])
     if missing:
         raise SystemExit(f"{path} missing columns: {sorted(missing)}")
+    for row in rows:
+        for name in NUMERIC_FEATURES:
+            row.setdefault(name, "0")
     return rows
 
 
@@ -61,6 +64,34 @@ def matrix(rows: list[dict], vectorizer: TfidfVectorizer, scaler: StandardScaler
         x_text = vectorizer.transform(texts)
         x_num = scaler.transform(nums)
     return hstack([x_text, x_num])
+
+
+def coefficient_report(
+    *,
+    vectorizer: TfidfVectorizer,
+    classifier: LogisticRegression,
+    top_n: int = 24,
+) -> dict:
+    coefs = classifier.coef_[0]
+    text_names = list(vectorizer.get_feature_names_out())
+    text_coefs = coefs[: len(text_names)]
+    numeric_coefs = coefs[len(text_names) :]
+
+    def top_pairs(names: list[str], values: np.ndarray, *, reverse: bool) -> list[dict]:
+        order = np.argsort(values)
+        if reverse:
+            order = order[::-1]
+        return [
+            {"name": names[int(i)], "weight": float(values[int(i)])}
+            for i in order[: min(top_n, len(order))]
+        ]
+
+    return {
+        "top_positive_text": top_pairs(text_names, text_coefs, reverse=True),
+        "top_negative_text": top_pairs(text_names, text_coefs, reverse=False),
+        "top_positive_numeric": top_pairs(NUMERIC_FEATURES, numeric_coefs, reverse=True),
+        "top_negative_numeric": top_pairs(NUMERIC_FEATURES, numeric_coefs, reverse=False),
+    }
 
 
 def choose_threshold(y_true: np.ndarray, prob: np.ndarray, *, min_precision: float) -> tuple[float, dict]:
@@ -164,11 +195,12 @@ def main() -> None:
             output_dict=True,
             zero_division=0,
         ),
+        "feature_weights": coefficient_report(vectorizer=vectorizer, classifier=classifier),
     }
 
     checkpoint = {
         "kind": "session_health",
-        "version": 1,
+        "version": 2,
         "vectorizer": vectorizer,
         "scaler": scaler,
         "classifier": classifier,
@@ -194,4 +226,3 @@ def main() -> None:
 
 if __name__ == "__main__":
     main()
-
