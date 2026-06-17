@@ -131,10 +131,52 @@ just run-router
 setup instructions, and starts the LiteLLM-compatible proxy at
 `http://localhost:4000`.
 
-### Point Goose at it
+### Persistent Goose config
+
+Goose can use a declarative custom provider, which is cleaner than exporting
+`LITELLM_HOST` every time. Create:
+
+```text
+~/.config/goose/custom_providers/router.json
+```
+
+```json
+{
+  "name": "router",
+  "engine": "openai",
+  "display_name": "llm-router",
+  "description": "NVIDIA LLM Router v3 public-trace router",
+  "base_url": "http://localhost:4000",
+  "api_key_env": "",
+  "requires_auth": false,
+  "supports_streaming": true,
+  "timeout_seconds": 600,
+  "models": [
+    {
+      "name": "nvidia-routed",
+      "context_limit": 200000
+    }
+  ]
+}
+```
+
+Then run Goose with:
 
 ```bash
-LITELLM_HOST=http://localhost:4000 LITELLM_API_KEY=sk-local \
+GOOSE_PROVIDER=router GOOSE_MODEL=nvidia-routed goose
+```
+
+The `context_limit` should be the smallest context window of any real model the
+router may choose. For the current pool that is `200000`, because the router can
+select Anthropic Claude models. Setting it higher would let Goose build a prompt
+that some routed backends cannot accept; setting it lower just compacts earlier
+than necessary. If you change the model pool, update this value to the new safe
+floor.
+
+### Point Goose at it without custom config
+
+```bash
+LITELLM_HOST=http://localhost:4000 LITELLM_API_KEY=sk-local GOOSE_CONTEXT_LIMIT=200000 \
 GOOSE_PROVIDER=litellm GOOSE_MODEL=nvidia-routed \
 goose
 ```
@@ -142,7 +184,7 @@ goose
 One-shot:
 
 ```bash
-LITELLM_HOST=http://localhost:4000 LITELLM_API_KEY=sk-local \
+LITELLM_HOST=http://localhost:4000 LITELLM_API_KEY=sk-local GOOSE_CONTEXT_LIMIT=200000 \
 GOOSE_PROVIDER=litellm GOOSE_MODEL=nvidia-routed \
 goose run --name routed-task -t "<your task>"
 ```

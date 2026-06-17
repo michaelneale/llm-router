@@ -277,16 +277,33 @@ def goose_instructions(port: int, repo_id: str) -> None:
 
               just run-router
 
-            Use it with Goose, one-shot:
+            Recommended Goose provider:
+
+              write ~/.config/goose/custom_providers/router.json with:
+              {{
+                "name": "router",
+                "engine": "openai",
+                "display_name": "llm-router",
+                "base_url": "http://localhost:{port}",
+                "api_key_env": "",
+                "requires_auth": false,
+                "supports_streaming": true,
+                "timeout_seconds": 600,
+                "models": [{{"name": "nvidia-routed", "context_limit": 200000}}]
+              }}
+
+              GOOSE_PROVIDER=router GOOSE_MODEL=nvidia-routed goose
+
+            Env-only Goose fallback, one-shot:
 
               cd <repo-you-want-goose-to-work-on>
-              LITELLM_HOST=http://localhost:{port} LITELLM_API_KEY=sk-local \\
+              LITELLM_HOST=http://localhost:{port} LITELLM_API_KEY=sk-local GOOSE_CONTEXT_LIMIT=200000 \\
               GOOSE_PROVIDER=litellm GOOSE_MODEL=nvidia-routed \\
               goose run --name routed-task -t "<your task>"
 
-            Use it with Goose, interactive:
+            Env-only Goose fallback, interactive:
 
-              LITELLM_HOST=http://localhost:{port} LITELLM_API_KEY=sk-local \\
+              LITELLM_HOST=http://localhost:{port} LITELLM_API_KEY=sk-local GOOSE_CONTEXT_LIMIT=200000 \\
               GOOSE_PROVIDER=litellm GOOSE_MODEL=nvidia-routed \\
               goose
 
