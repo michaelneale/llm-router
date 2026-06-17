@@ -10,10 +10,10 @@
 # `display_name` / `litellm_model` are the current provider models we serve in
 # that slot. This aggressive pool uses Claude Opus 4.8 as the frontier/top
 # escalation slot, caps the high automatic slot at GPT-5.4 Mini, and uses GPT
-# mini/nano variants plus Haiku/Sonnet below that. The current trial tolerance is
-# 0.145: a high-savings local replay point with about 3.9pp public verified-label
-# loss. Use ROUTER_TOLERANCE or scripts/select_router_operating_point.py for
-# sweeps.
+# mini/nano variants plus a GPT-5.4 Mini cap before Sonnet. The current trial
+# tolerance is 0.145: a high-savings local replay point with about 3.9pp public
+# verified-label loss. Use ROUTER_TOLERANCE or scripts/select_router_operating_point.py
+# for sweeps.
 routing:
   method: prefill
   checkpoint: checkpoints/prefill_router_combined.pt
@@ -79,10 +79,10 @@ models:
     cost_per_m_input_tokens: 0.75
     cost_per_m_output_tokens: 4.50
   - name: gpt-4-1-mini-high
-    display_name: Claude Haiku 4.5
-    litellm_model: anthropic/claude-haiku-4-5-20251001
-    cost_per_m_input_tokens: 1.00
-    cost_per_m_output_tokens: 5.00
+    display_name: GPT-5.4 Mini
+    litellm_model: openai/gpt-5.4-mini
+    cost_per_m_input_tokens: 0.75
+    cost_per_m_output_tokens: 4.50
   - name: claude-sonnet-4-6-high
     display_name: Claude Sonnet 4.6
     litellm_model: anthropic/claude-sonnet-4-6

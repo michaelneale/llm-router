@@ -108,8 +108,7 @@ Provider models in the active ladder:
 |---|---|
 | cheapest | `openai/gpt-5-nano` |
 | cheap | `openai/gpt-5-mini` |
-| high-mini | `openai/gpt-5.4-mini` |
-| mid | `anthropic/claude-haiku-4-5-20251001` |
+| high-mini / capped mid | `openai/gpt-5.4-mini` |
 | strong | `anthropic/claude-sonnet-4-6` |
 | top | `anthropic/claude-opus-4-8` |
 
