@@ -15,97 +15,123 @@ The core insight: lightweight models can handle a substantial set of queries cor
 
 ---
 
-## Fork addendum: a *personalized* router for your own agent (goose)
+## Fork addendum: public-trace router for agent work
 
-> This fork extends the NVIDIA blueprint with one idea: **instead of training the
-> router on generic benchmarks, train it on _your own_ assistant transcripts** —
-> the actual prompts you type to a coding agent like [goose](https://github.com/block/goose).
-> The router then learns which of *your* requests genuinely need a frontier model
-> and which a cheap model handles fine, and routes accordingly behind an
-> OpenAI-compatible proxy. It also ships a **live savings dashboard** so you can
-> watch the cost reduction in real time as you work.
+> This branch keeps the v3 premise: route each turn to the cheapest model that
+> should preserve frontier-quality outcomes. It is **not** trained on private
+> Goose sessions. The active router is trained from public verified traces,
+> mapped onto current OpenAI/Anthropic provider models, and packaged so Goose or
+> any OpenAI-compatible client can use it through LiteLLM.
 
 <p>
-  <img src="docs/img/router-dashboard-overview.jpg" alt="LLM Router live savings dashboard showing cost saved, runtime tolerance, cache pinning, and top tier controls">
+  <img src="docs/img/router-dashboard-overview.jpg" alt="LLM Router live dashboard showing savings, runtime tolerance, cache controls, and routing controls">
 </p>
 
 <p>
-  <img src="docs/img/router-dashboard-models.jpg" alt="LLM Router dashboard showing provider model ladder and routing distribution">
+  <img src="docs/img/router-dashboard-models.jpg" alt="LLM Router dashboard showing provider model ladder and live routing distribution">
 </p>
 
-*The `/dashboard` endpoint: real-time % saved vs. a frontier baseline, routing
-distribution across tiers, and a resettable counter — populated from your actual
-streaming sessions.*
+*The `/dashboard` endpoint shows the live provider model ladder, routing
+distribution, tolerance controls, cache mode, session-health escalations, and
+cost saved vs. a frontier baseline.*
 
-### Why personalize?
+### What this branch runs
 
-The upstream blueprint assumes you collect labels over benchmark-style questions
-(MMLU, math, coding tasks judged by majority vote or ground-truth answers). That
-produces a router calibrated for *textbook* difficulty. But your real traffic
-doesn't look like a benchmark — it looks like *"list files here"*, *"any open PRs
-from alex?"*, *"never force push, why would you do that"*. A router trained on
-**your** distribution learns that most of that routes safely to a small model,
-while reserving the top tier for the genuinely hard turns. In practice this fork
-routes a real mix across tiers and reports **>90% cost savings** versus sending
-everything to the frontier model.
+The default path is `configs/combined-pool.yaml`:
 
-### Train it for yourself
+- `checkpoints/prefill_router_combined.pt` predicts which model should be good
+  enough for the current turn.
+- `checkpoints/session_health_public.pkl` is a second learned gate that detects
+  bad agent trajectories and forces the top tier only at a conservative
+  threshold.
+- `just run-router` downloads those active artifacts from Hugging Face
+  (`micdn/llm-router-goose-public`) when missing, then starts the proxy on port
+  `4000`.
 
-You build your own checkpoint from your own agent history — no shared weights
-required (see [Pretrained weights](#pretrained-weights) below for why).
+The old private Goose-session checkpoint experiment,
+`checkpoints/prefill_router_goose.pt`, is deliberately excluded from the
+artifact bundle and is not used by the default config.
+
+### How it was trained
+
+The prefill router is trained from public verified multi-model success matrices,
+not from one user's Goose history:
+
+- **RouterBench** (`withmartian/routerbench`) for broad Q&A, reasoning, math,
+  and coding correctness over many source LLMs.
+- **SWE-bench Verified trajectories** (`tarsur385/swebench-verified-trajectories`)
+  for code-fixing tasks with machine-verified `resolved` labels.
+- **Terminal-Bench trajectories** (`yoonholee/terminalbench-trajectories`) plus
+  task instructions for terminal and ops tasks with verified `reward` labels.
+
+Those sources give the label the original v3 idea needs: for the same task, did
+each cheaper or stronger model actually succeed? The current combined training
+set spans roughly 70k labeled rows over 8.7k tasks, mapped onto the live provider
+pool in `configs/combined-pool.yaml`.
+
+The session-health gate is trained separately from public Hugging Face
+trajectory windows. It learns `bad_next`: whether the recent trace prefix has
+reached a deterioration point. Its useful signal is not user frustration words;
+it is prefix-visible churn such as repeated commands, repeated test failures,
+timeouts, missing dependencies, patch/test/error loops, and late unrecovered
+failures. The v2 public split currently uses threshold `0.88` with precision
+`0.844`, recall `0.169`, and ROC-AUC `0.813`.
+
+### What is novel here
+
+- Uses **verified multi-model outcomes** instead of plausibility judging or bare
+  prompt difficulty labels.
+- Adds public agent-trace training for a **learned trajectory-health escalation
+  gate**, separate from the per-turn cost router.
+- Uses trace-derived operational features for the health classifier; the regexes
+  extract commands, errors, patches, retries, and failures as model inputs rather
+  than acting as a keyword escalation overlay.
+- Maps trained checkpoint slots onto a live provider pool and exposes the real
+  provider models in the dashboard.
+- Adds cost accounting, streaming usage capture, live tolerance/cache controls,
+  prompt-cache-aware switching, GPU routing support, and a reproducible Hugging
+  Face artifact launcher.
+
+### Current operating point
+
+The current config is intentionally aggressive for real Goose trials:
+
+- tolerance `0.145`
+- top escalation model: `anthropic/claude-opus-4-8`
+- manual hard override: prefix a task with `!hard`
+- session-health escalation: enabled at threshold `0.88`
+- cache pinning: off by default, with live dashboard controls
+
+Provider models in the active ladder:
+
+| Role | Real provider model |
+|---|---|
+| cheapest | `openai/gpt-5-nano` |
+| cheap | `openai/gpt-5-mini` |
+| high-mini | `openai/gpt-5.4-mini` |
+| mid | `anthropic/claude-haiku-4-5-20251001` |
+| strong | `anthropic/claude-sonnet-4-6` |
+| top | `anthropic/claude-opus-4-8` |
+
+Offline calibration says this setting allows a small public verified-label loss
+for materially higher savings. Treat the dashboard as cost evidence only; real
+quality still needs live task checks against a fixed frontier baseline.
+
+### Run it
 
 ```bash
-# 0. Install (see Getting Started) and activate the venv
+python3 -m venv .venv
+. .venv/bin/activate
 pip install -e '.[proxy]'
 
-# 1. Extract genuine prompts from your goose session history.
-#    Reads ~/.local/share/goose/sessions/sessions.db, drops slash-commands,
-#    compaction summaries, synthetic turns, near-duplicates; tags continuations.
-python scripts/extract_goose_questions.py --out data/goose-questions.txt
-
-# 2. Label them: send each question to every model in the pool and record
-#    which models answer acceptably (majority-vote judging needs no ground truth).
-model-router collect \
-  --questions data/goose-questions.txt \
-  --pool-config configs/goose-mix.yaml \
-  --out data/goose-collected.csv
-
-# 3. Train the prefill router (encoder hidden states -> PCA -> MLP per model).
-model-router train \
-  --data data/goose-collected.csv \
-  --pool-config configs/goose-mix.yaml \
-  --out checkpoints/prefill_router_goose.pt
-
-# 4. (optional) Re-price the checkpoint's pool to match current provider costs.
-python scripts/patch_checkpoint_costs.py \
-  checkpoints/prefill_router_goose.pt configs/goose-mix.yaml
+just run-router
 ```
 
-`configs/goose-mix.yaml` is the example pool used here — a tiered mix of
-OpenAI/Anthropic models (cheap `gpt-*-nano` tiers up to a frontier
-Claude Opus baseline). Edit it to match the models and prices you actually have
-keys for; model **costs** drive the routing economics and the savings math.
+`just run-router` downloads the active public artifacts if needed, prints Goose
+setup instructions, and starts the LiteLLM-compatible proxy at
+`http://localhost:4000`.
 
-### Run the proxy
-
-```bash
-# Start proxy + dashboard on :4000. Reads OPENAI_API_KEY/ANTHROPIC_API_KEY from
-# the env, or falls back to the macOS "goose" keychain entry. Picks mps on Apple
-# Silicon (~0.1-0.4s/route) else cpu (~9s/route).
-./scripts/run.sh
-
-# Override port:
-PORT=4100 ./scripts/run.sh
-
-# By hand (no helper):
-model-router proxy-config --config configs/goose-mix.yaml --output configs/litellm-goose.yaml
-ROUTER_DEVICE=mps model-router proxy \
-  --router-config configs/goose-mix.yaml \
-  --litellm-config configs/litellm-goose.yaml \
-  --port 4000
-```
-
-### Point goose at it
+### Point Goose at it
 
 ```bash
 LITELLM_HOST=http://localhost:4000 LITELLM_API_KEY=sk-local \
@@ -113,84 +139,45 @@ GOOSE_PROVIDER=litellm GOOSE_MODEL=nvidia-routed \
 goose
 ```
 
-### Run the verified-label router (recommended)
-
-Trained on verified multi-model success across the full difficulty range —
-RouterBench (general Q&A), SWE-bench (coding), terminal-bench (ops). See
-`docs/LAB_NOTE.md`. On held-out tasks it matches frontier quality at lower cost
-and routes by difficulty (easy→cheap, hard→top).
+One-shot:
 
 ```bash
-ROUTER_DEVICE=mps model-router proxy \
-  --router-config configs/combined-pool.yaml \
-  --litellm-config configs/litellm-combined.yaml \
-  --port 4000
-# then point goose at it exactly as above (GOOSE_MODEL=nvidia-routed)
+LITELLM_HOST=http://localhost:4000 LITELLM_API_KEY=sk-local \
+GOOSE_PROVIDER=litellm GOOSE_MODEL=nvidia-routed \
+goose run --name routed-task -t "<your task>"
 ```
-
-The checkpoint (`checkpoints/prefill_router_combined.pt`) is gitignored;
-regenerate with `scripts/pull_*` + `scripts/build_full_training.py` then
-`model-router train --config configs/combined-pool.yaml --data data/full-train.csv`.
-
-A `configs/swebench-pool.yaml` (coding-only) is also included for comparison.
-Personalizing to your own traffic needs verifiable success labels from your own
-sessions — the open next step in the lab note.
 
 ### Endpoints
 
 | Endpoint | Purpose |
 |---|---|
-| `POST /v1/chat/completions` | OpenAI-compatible — point goose / any client here |
-| `GET  /dashboard` | live savings web page (auto-refreshes every 3s) |
+| `POST /v1/chat/completions` | OpenAI-compatible proxy endpoint |
+| `GET  /dashboard` | live savings and routing controls |
 | `GET  /savings` | same data as JSON |
-| `POST /savings/reset` | zero the counters |
+| `POST /savings/reset` | reset live counters |
+| `POST /routing/tolerance` | change tolerance without restarting |
+| `POST /routing/cache-pinning` | change cache pinning without restarting |
 
-Streaming is counted (the proxy forces `stream_options.include_usage` and taps
-the SSE stream). The dashboard tracks **cost, not answer quality**.
+### Notes on personalization
 
-### Routed vs frontier: a real task
-
-Same task (upgrade `iroh` rc.0 → rc.1 in a Rust workspace, fix API breaks,
-validate), same repo context (`AGENTS.md` + skills), once routed (→ gpt-5-mini)
-and once direct to Opus 4.8.
-
-- **Code: a tie.** Both produced a correct migration and the same three API-break
-  fixes.
-- **Follow-through: Opus won.** The repo's `AGENTS.md` documents a validation
-  procedure (build, clippy, multi-node + public-mesh tests). Opus read it and
-  ran it end-to-end (built, tested 4/4 relay tests, joined the public mesh, ran a
-  live inference round-trip). The routed model read the same file, built locally,
-  then handed the validation back as a "recommendation."
-
-The savings number can't see this: per-turn coding quality rarely needs a
-frontier model, but **agentic completeness** (sustaining a long task to done)
-does, and a cost dashboard won't show the difference.
-
-### Pretrained weights
-
-**This fork intentionally does not ship a trained `.pt` checkpoint, by design:**
-
-1. **Privacy** — the weights are learned from personal assistant transcripts. They
-   encode decision boundaries derived from real prompts, file paths, and repo/PR
-   references. Sharing the artifact leaks more about the author's workload than it
-   helps you.
-2. **It wouldn't generalize** — a checkpoint trained on one person's coding-agent
-   traffic will route *your* (e.g. legal, creative, support) traffic badly. The
-   value here is the **method**, not the artifact. Building your own takes minutes.
-
-If you want to distribute a checkpoint anyway, do it **out-of-band** rather than in
-git history: a Hugging Face model repo (with a model card noting the training
-source) or a GitHub Release asset are both clean options. `data/` and
-`checkpoints/*.pt` are `.gitignore`d here for exactly these reasons.
+Personalization is not the current default because the first Goose-session
+experiments did not produce reliable labels. Free-form agent prompts made cheap
+answers look either always acceptable or always worse than a frontier answer,
+depending on the judge setup. The useful future personalization path is
+verifiable local outcomes: tests passed, commands recovered, patches applied,
+CI went green, or task completion was observed. That can be layered over this
+public-trace router once the labels are good enough.
 
 ### What this fork added on top of the blueprint
 
-- `scripts/extract_goose_questions.py` — mine your goose `sessions.db` into clean training prompts.
-- `configs/goose-mix.yaml` — example tiered OpenAI/Anthropic pool with per-model costs.
-- `scripts/run-goose-proxy.sh` — one-command proxy launch; keychain key injection; GPU routing.
-- Live **savings tracking**: `adapters/litellm/savings.py` + `dashboard.py`, wired into the proxy (`/dashboard`, `/savings`, `/savings/reset`), with **streaming (SSE) usage capture** so interactive agent sessions are counted accurately.
-- `prefill/scorer.py` + `extract.py` — routing encoder device is now configurable via `ROUTER_DEVICE` (e.g. `mps` on Apple Silicon) instead of hardcoded CPU.
-- Helper scripts: `bench_routing.py` (offline routing distribution), `collect_fast.py`, `patch_checkpoint_costs.py`, `tolerance_curve.py`.
+- Public verified-trace training builders for SWE-bench, Terminal-Bench, and the
+  combined full-spectrum router.
+- Learned session-health escalation from public agent trajectories.
+- Hugging Face artifact packaging and downloader (`just run-router`).
+- Live dashboard for real provider models, savings, tolerance, cache mode, and
+  session-health escalations.
+- Streaming usage capture, cache-aware switching, explicit `!hard` top-tier
+  override, and configurable GPU routing (`ROUTER_DEVICE=mps`, CUDA, or CPU).
 
 ---
 
