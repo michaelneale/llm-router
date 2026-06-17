@@ -36,6 +36,10 @@ logs/
 CLAUDE.md
 AGENTS.md
 skills/
+!.agents/
+!.agents/skills/
+!.agents/skills/router-from-traces/
+!.agents/skills/router-from-traces/SKILL.md
 working/
 
 # ---------------------------------------------------------------------------
