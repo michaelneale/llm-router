@@ -127,8 +127,13 @@ just run-router
 ```
 
 `just run-router` downloads the active public artifacts if needed, prints Goose
-setup instructions, and starts the LiteLLM-compatible proxy at
-`http://localhost:4000`.
+setup instructions, regenerates the LiteLLM proxy config from
+`configs/combined-pool.yaml`, and starts the router at `http://localhost:4000`.
+For a quick local restart without the artifact/instruction step, run:
+
+```bash
+./scripts/restart-router.sh
+```
 
 ### Persistent Goose config
 

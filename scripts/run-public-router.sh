@@ -20,4 +20,4 @@ fi
 
 export POOL="${POOL:-configs/combined-pool.yaml}"
 export LITELLM="${LITELLM:-configs/litellm-combined.yaml}"
-exec ./scripts/run.sh
+exec ./scripts/restart-router.sh

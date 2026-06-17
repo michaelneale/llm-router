@@ -16,6 +16,10 @@ goose-instructions:
 run-router:
     @ROUTER_ARTIFACT_REPO="{{artifact_repo}}" PORT="{{port}}" ./scripts/run-public-router.sh
 
+# Restart the local router using the active combined pool.
+restart-router:
+    @PORT="{{port}}" ./scripts/restart-router.sh
+
 # Upload the active public artifact bundle to Hugging Face.
 upload-artifacts:
     @.venv/bin/python scripts/router_artifacts.py upload --repo "{{artifact_repo}}"

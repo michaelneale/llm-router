@@ -7,15 +7,15 @@
 #   - Auto-detects the routing device (mps on Apple Silicon, else cpu).
 #
 # Usage:
-#   ./scripts/run.sh                       # defaults: port 4000, configs/*-goose.yaml
+#   ./scripts/run.sh                       # defaults: port 4000, configs/combined-pool.yaml
 #   PORT=4100 ./scripts/run.sh
 #   ROUTER_DEVICE=cuda ./scripts/run.sh
 #   POOL=configs/my-mix.yaml ./scripts/run.sh
 set -euo pipefail
 cd "$(dirname "$0")/.."
 
-POOL="${POOL:-configs/goose-mix.yaml}"
-LITELLM="${LITELLM:-configs/litellm-goose.yaml}"
+POOL="${POOL:-configs/combined-pool.yaml}"
+LITELLM="${LITELLM:-configs/litellm-combined.yaml}"
 PORT="${PORT:-4000}"
 ROUTER_ROUTE_LOG="${ROUTER_ROUTE_LOG:-/tmp/router-routes.jsonl}"
 export ROUTER_ROUTE_LOG
@@ -57,10 +57,10 @@ fi
 export ROUTER_DEVICE
 export ROUTER_DISABLE_SWITCHING="${ROUTER_DISABLE_SWITCHING:-0}"
 
-# --- ensure the litellm config exists (generate from the pool if missing) ---
+# --- keep the generated litellm config in sync with the selected pool ---
 BIN=".venv/bin/model-router"
 [[ -x "$BIN" ]] || BIN="model-router"   # fall back to PATH
-if [[ ! -f "$LITELLM" ]]; then
+if [[ "${ROUTER_REGENERATE_LITELLM:-1}" == "1" || ! -f "$LITELLM" || "$POOL" -nt "$LITELLM" ]]; then
   echo "Generating $LITELLM from $POOL ..."
   "$BIN" proxy-config --config "$POOL" --output "$LITELLM"
 fi

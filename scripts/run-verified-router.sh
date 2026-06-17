@@ -16,4 +16,4 @@ export ROUTER_DISABLE_SWITCHING="${ROUTER_DISABLE_SWITCHING:-0}"
 export HF_HUB_OFFLINE="${HF_HUB_OFFLINE:-1}"
 export TRANSFORMERS_OFFLINE="${TRANSFORMERS_OFFLINE:-1}"
 
-exec ./scripts/run.sh
+exec ./scripts/restart-router.sh
