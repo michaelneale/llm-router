@@ -2,8 +2,7 @@
 """Upload/download the public router artifact bundle.
 
 The repository keeps checkpoints out of git. This script makes the active
-public-derived checkpoints reproducible to fetch while deliberately excluding
-private/personal experiment artifacts.
+public-derived checkpoints reproducible to fetch.
 """
 
 from __future__ import annotations
@@ -109,12 +108,6 @@ def build_manifest(repo_id: str) -> dict[str, Any]:
         "kind": "llm-router-public-artifacts",
         "version": 1,
         "active_runtime_config": "configs/combined-pool.yaml",
-        "excluded": [
-            {
-                "path": "checkpoints/prefill_router_goose.pt",
-                "reason": "private Goose-session experiment; not used by configs/combined-pool.yaml",
-            }
-        ],
         "artifacts": artifacts,
     }
 
@@ -136,8 +129,7 @@ tags:
 
 # LLM Router Public Artifacts
 
-Public artifact bundle for the `goose-personalized-router` branch of
-`llm-router`.
+Public artifact bundle for the public-trace LLM router branch.
 
 ## Files
 
@@ -146,13 +138,11 @@ Public artifact bundle for the `goose-personalized-router` branch of
 ## Provenance
 
 - `prefill_router_combined.pt` is the active prefill router checkpoint used by
-  `configs/combined-pool.yaml`. It maps public verified trace labels onto the
-  callable OpenAI/Anthropic model pool in that config.
+  `configs/combined-pool.yaml`. It was built from public verified trace labels
+  and the callable model pool in that config.
 - `session_health_public.pkl` is the active v2 session-health checkpoint. Its
   embedded report points at `data_public/session-health-windows-v2.csv`, built
   from public SWE-bench and TerminalBench Hugging Face traces.
-- `checkpoints/prefill_router_goose.pt` is deliberately not included; it was a
-  private Goose-session experiment and is not used by the active config.
 
 ## Use
 

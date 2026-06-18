@@ -1,9 +1,9 @@
 #!/usr/bin/env python3
 """Build public-HF session-health training windows.
 
-This intentionally ignores private Goose/Codex sessions. It reads public raw
-agent traces from Hugging Face and emits rolling trajectory windows for a binary
-target: whether the current trajectory prefix is going badly.
+This reads public raw agent traces from Hugging Face and emits rolling trajectory
+windows for a binary target: whether the current trajectory prefix is going
+badly.
 """
 
 from __future__ import annotations

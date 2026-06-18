@@ -39,7 +39,7 @@ TOLERANCES = [0.05, 0.20]
 
 
 def main() -> None:
-    config = load_config("configs/goose-mix.yaml")
+    config = load_config("configs/combined-pool.yaml")
     display = {m.name: m.display_name for m in config.models}
     cost_out = {m.name: m.cost_per_m_output_tokens for m in config.models}
     router = build_router_from_config(config)

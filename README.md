@@ -1,27 +1,28 @@
-# NVIDIA AI Blueprint: LLM Router v3 — Complexity-Based Optimization
+# Public-Trace LLM Router
 
-**Use the most efficient and accurate model for every LLM call.**
+**Route each agent turn to the cheapest model that should still preserve
+frontier-quality outcomes.**
 
-Model Router learns which models handle which types of queries well and routes each request to the most efficient model that meets your accuracy threshold. Instead of over-provisioning with a single large frontier model or under-serving with a small efficient one, the router matches query complexity to model capability automatically.
+This fork builds on NVIDIA LLM Router v3's prefill routing idea. The important
+change is the training source: this branch uses public Hugging Face and
+benchmark traces to build a multi-model correctness matrix, rather than relying
+on bare prompt difficulty labels.
 
-The core insight: lightweight models can handle a substantial set of queries correctly and efficiently. The router learns which queries those are, sends them to smaller models, and reserves large frontier models for the queries that genuinely need them.
+The router learns:
+
+```text
+P(success | task/context, model)
+```
+
+At runtime it does not call every model. It runs the current turn/context through
+a small local encoder, reads hidden-state features, predicts success for each
+candidate model, then chooses the lowest-cost model inside the configured quality
+tolerance band.
 
 > [!NOTE]
-> **Reference implementation only.** This branch is a reference implementation demonstrating prefill-based LLM routing. For production deployment, please fork this repository and leverage the relevant components for your use case. If you encounter issues or have questions, please [open an issue](../../issues/new).
-
----
-
-> **Branch: v3-prefill** — This branch contains LLM Router v3, a prefill complexity-based routing system that learns which models handle which queries well and routes each request to the most efficient model that meets your accuracy threshold. For the intent/multimodal router (v2), see the [experimental](../../tree/experimental) branch. For the original BERT-based router (v1), see [main](../../tree/main).
-
----
-
-## Fork addendum: public-trace router for agent work
-
-> This branch keeps the v3 premise: route each turn to the cheapest model that
-> should preserve frontier-quality outcomes. It is **not** trained on private
-> Goose sessions. The active router is trained from public verified traces,
-> mapped onto current OpenAI/Anthropic provider models, and packaged so Goose or
-> any OpenAI-compatible client can use it through LiteLLM.
+> This is a reference implementation for local experimentation. The active
+> launcher downloads public-trace-trained artifacts when they are missing and
+> starts an OpenAI-compatible LiteLLM proxy for Goose or any similar client.
 
 <p>
   <img src="docs/img/router-dashboard-overview.jpg" alt="LLM Router live dashboard showing savings, runtime tolerance, cache controls, and routing controls">
@@ -35,7 +36,66 @@ The core insight: lightweight models can handle a substantial set of queries cor
 distribution, tolerance controls, cache mode, session-health escalations, and
 cost saved vs. a frontier baseline.*
 
-### What this branch runs
+## The Basic Idea
+
+Training here is the whole offline process: build the model-by-task correctness
+matrix, extract prefill hidden-state features, and fit a small classical ML head
+that predicts success probabilities.
+
+| Stage | What happens | Output |
+|---|---|---|
+| Pick tasks | Use public HF/benchmark traces as task sources. | public prompt/task set |
+| Label models | For each task and each candidate model, decide whether that model succeeded. Use real verifiers when available. | `question,model,isCorrect,output_tokens` rows |
+| Extract features | Run the task/context through the local Qwen encoder and keep hidden-state features. | compact task features |
+| Train head | Fit the router head to predict `P(success | task, model)`. | `checkpoints/*.pt` |
+| Sweep policy | Tune `tolerance` so we find the cost/quality knee. | runtime config |
+| Serve | Predict success locally, then route to the cheapest acceptable model. | OpenAI-compatible proxy |
+
+Example correctness matrix:
+
+| Question/task | Model | `isCorrect` | Meaning |
+|---|---|---:|---|
+| "fix this SWE-bench bug..." | `openrouter/openai/gpt-oss-120b` | `0` | tried the task and failed verifier/judge |
+| same task | `openrouter/qwen/qwen3.5-35b-a3b` | `0` | tried the same task and failed |
+| same task | `openai/gpt-5-mini` | `1` | solved the task |
+| same task | `anthropic/claude-sonnet-4-6` | `1` | solved the task |
+| same task | `anthropic/claude-opus-4-8` | `1` | solved the task |
+
+Runtime selection:
+
+```text
+Predicted success:
+  openrouter/openai/gpt-oss-120b        0.70
+  openrouter/qwen/qwen3.5-35b-a3b       0.77
+  openai/gpt-5-mini                     0.86
+  anthropic/claude-sonnet-4-6           0.88
+  anthropic/claude-opus-4-8             0.89
+
+tolerance = 0.05
+best = 0.89
+acceptable >= 0.84
+
+selected = openai/gpt-5-mini, because it is the cheapest acceptable model
+```
+
+Cost is not what the model is trained to predict. The trained head predicts
+quality. The runtime routing policy then applies costs and tolerance.
+
+## What Is Novel Here
+
+- Uses public HF/benchmark traces as a scalable source of agent and task data.
+- Trains from a **multi-model correctness matrix**: for the same task, did each
+  candidate model succeed?
+- Uses prefill hidden states from a small local encoder as the task signal, then
+  trains a lightweight ML head on top.
+- Makes routing a quality-constrained cost decision: pick the cheapest model
+  close enough to the predicted best.
+- Adds a separate public-trace-trained session-health gate that can force the
+  top tier when recent trajectory features look bad.
+- Packages the active artifacts on Hugging Face so a fresh checkout can run
+  without locally retraining first.
+
+## Current Bundled Router
 
 The default path is `configs/combined-pool.yaml`:
 
@@ -47,52 +107,6 @@ The default path is `configs/combined-pool.yaml`:
 - `just run-router` downloads those active artifacts from Hugging Face
   (`micdn/llm-router-goose-public`) when missing, then starts the proxy on port
   `4000`.
-
-The old private Goose-session checkpoint experiment,
-`checkpoints/prefill_router_goose.pt`, is deliberately excluded from the
-artifact bundle and is not used by the default config.
-
-### How it was trained
-
-The prefill router is trained from public verified multi-model success matrices,
-not from one user's Goose history:
-
-- **RouterBench** (`withmartian/routerbench`) for broad Q&A, reasoning, math,
-  and coding correctness over many source LLMs.
-- **SWE-bench Verified trajectories** (`tarsur385/swebench-verified-trajectories`)
-  for code-fixing tasks with machine-verified `resolved` labels.
-- **Terminal-Bench trajectories** (`yoonholee/terminalbench-trajectories`) plus
-  task instructions for terminal and ops tasks with verified `reward` labels.
-
-Those sources give the label the original v3 idea needs: for the same task, did
-each cheaper or stronger model actually succeed? The current combined training
-set spans roughly 70k labeled rows over 8.7k tasks, mapped onto the live provider
-pool in `configs/combined-pool.yaml`.
-
-The session-health gate is trained separately from public Hugging Face
-trajectory windows. It learns `bad_next`: whether the recent trace prefix has
-reached a deterioration point. Its useful signal is not user frustration words;
-it is prefix-visible churn such as repeated commands, repeated test failures,
-timeouts, missing dependencies, patch/test/error loops, and late unrecovered
-failures. The v2 public split currently uses threshold `0.88` with precision
-`0.844`, recall `0.169`, and ROC-AUC `0.813`.
-
-### What is novel here
-
-- Uses **verified multi-model outcomes** instead of plausibility judging or bare
-  prompt difficulty labels.
-- Adds public agent-trace training for a **learned trajectory-health escalation
-  gate**, separate from the per-turn cost router.
-- Uses trace-derived operational features for the health classifier; the regexes
-  extract commands, errors, patches, retries, and failures as model inputs rather
-  than acting as a keyword escalation overlay.
-- Maps trained checkpoint slots onto a live provider pool and exposes the real
-  provider models in the dashboard.
-- Adds cost accounting, streaming usage capture, live tolerance/cache controls,
-  prompt-cache-aware switching, GPU routing support, and a reproducible Hugging
-  Face artifact launcher.
-
-### Current operating point
 
 The current config is intentionally aggressive for real Goose trials:
 
@@ -112,16 +126,70 @@ Provider models in the active ladder:
 | strong | `anthropic/claude-sonnet-4-6` |
 | top | `anthropic/claude-opus-4-8` |
 
-Offline calibration says this setting allows a small public verified-label loss
-for materially higher savings. Treat the dashboard as cost evidence only; real
-quality still needs live task checks against a fixed frontier baseline.
+Treat the dashboard as cost evidence only. Real quality still needs live task
+checks against a fixed frontier baseline.
 
-### Run it
+## Public Training Sources
+
+The prefill router is trained from public verified multi-model success matrices:
+
+- **RouterBench** (`withmartian/routerbench`) for broad Q&A, reasoning, math,
+  and coding correctness over many source LLMs.
+- **SWE-bench Verified trajectories** (`tarsur385/swebench-verified-trajectories`)
+  for code-fixing tasks with machine-verified `resolved` labels.
+- **Terminal-Bench trajectories** (`yoonholee/terminalbench-trajectories`) plus
+  task instructions for terminal and ops tasks with verified `reward` labels.
+
+Those sources give the label the original v3 idea needs: for the same task, did
+each cheaper or stronger model actually succeed? The current bundled checkpoint
+uses the existing public verified labels and the provider mapping in
+`configs/combined-pool.yaml`. The cleaner next retrain is to build the same
+matrix with the exact real model IDs served at runtime.
+
+The session-health gate is trained separately from public Hugging Face
+trajectory windows. It learns `bad_next`: whether the recent trace prefix has
+reached a deterioration point. Its useful signal is not user frustration words;
+it is prefix-visible churn such as repeated commands, repeated test failures,
+timeouts, missing dependencies, patch/test/error loops, and late unrecovered
+failures. The v2 public split currently uses threshold `0.88` with precision
+`0.844`, recall `0.169`, and ROC-AUC `0.813`.
+
+## Retraining For A New Model Ladder
+
+The reusable workflow is captured as a repo-scoped Codex/Goose skill:
+
+```text
+.agents/skills/router-from-traces/SKILL.md
+```
+
+Use that skill when changing the real model pool. A proper retrain should use
+real model names in the matrix, config, checkpoint, and dashboard. Do not train
+against vague slots and then remap those slots later.
+
+The next candidate ladder is recorded in `TODO.md`:
+
+```text
+openrouter/openai/gpt-oss-120b
+openrouter/qwen/qwen3.5-35b-a3b
+openai/gpt-5-mini
+anthropic/claude-sonnet-4-6
+anthropic/claude-opus-4-8
+```
+
+For that ladder, use OpenRouter only for the open/OSS-style lower tiers and use
+direct OpenAI/Anthropic keys for `gpt-5-mini`, Sonnet, and Opus.
+
+If users only edit the dashboard/config to bind a different model to a learned
+tier, that can be useful for exploration, but it is not the same as a proper
+retrain. A proper quality claim requires a correctness matrix for the actual
+models being served.
+
+## Run It
 
 ```bash
 python3 -m venv .venv
 . .venv/bin/activate
-pip install -e '.[proxy]'
+pip install -e '.[prefill,proxy,verified-data]'
 
 just run-router
 ```
@@ -129,13 +197,17 @@ just run-router
 `just run-router` downloads the active public artifacts if needed, prints Goose
 setup instructions, regenerates the LiteLLM proxy config from
 `configs/combined-pool.yaml`, and starts the router at `http://localhost:4000`.
+On Apple Silicon, `scripts/run.sh` defaults the local prefill encoder to
+`ROUTER_DEVICE=mps`; set `ROUTER_DEVICE=cpu` or `ROUTER_DEVICE=cuda` to
+override it.
+
 For a quick local restart without the artifact/instruction step, run:
 
 ```bash
 ./scripts/restart-router.sh
 ```
 
-### Persistent Goose config
+## Use With Goose
 
 Goose can use a declarative custom provider, which is cleaner than exporting
 `LITELLM_HOST` every time. Create:
@@ -177,7 +249,7 @@ that some routed backends cannot accept; setting it lower just compacts earlier
 than necessary. If you change the model pool, update this value to the new safe
 floor.
 
-### Point Goose at it without custom config
+Point Goose at it without custom config:
 
 ```bash
 LITELLM_HOST=http://localhost:4000 LITELLM_API_KEY=sk-local GOOSE_CONTEXT_LIMIT=200000 \
@@ -193,7 +265,7 @@ GOOSE_PROVIDER=litellm GOOSE_MODEL=nvidia-routed \
 goose run --name routed-task -t "<your task>"
 ```
 
-### Endpoints
+## Dashboard And API
 
 | Endpoint | Purpose |
 |---|---|
@@ -204,17 +276,7 @@ goose run --name routed-task -t "<your task>"
 | `POST /routing/tolerance` | change tolerance without restarting |
 | `POST /routing/cache-pinning` | change cache pinning without restarting |
 
-### Notes on personalization
-
-Personalization is not the current default because the first Goose-session
-experiments did not produce reliable labels. Free-form agent prompts made cheap
-answers look either always acceptable or always worse than a frontier answer,
-depending on the judge setup. The useful future personalization path is
-verifiable local outcomes: tests passed, commands recovered, patches applied,
-CI went green, or task completion was observed. That can be layered over this
-public-trace router once the labels are good enough.
-
-### What this fork added on top of the blueprint
+## What This Fork Added
 
 - Public verified-trace training builders for SWE-bench, Terminal-Bench, and the
   combined full-spectrum router.
@@ -227,7 +289,12 @@ public-trace router once the labels are good enough.
 
 ---
 
-### How This Branch Differs
+## NVIDIA Blueprint Reference
+
+The sections below are the broader upstream v3 toolkit reference. They are still
+useful for lower-level CLI, library, proxy, training, and evaluation details.
+
+### Blueprint Branch Comparison
 
 | Feature | v1 (main) | v2 (experimental) | **v3-prefill (this branch)** |
 |---------|-----------|-------------------|------------------------------|
@@ -239,9 +306,7 @@ public-trace router once the labels are good enough.
 | **Proxying** | Yes | No (classification only) | Yes (routing + inference) |
 | **Deployment modes** | Docker | Docker | Library, server, sidecar, proxy, SDK |
 
----
-
-## Table of Contents
+### Table of Contents
 
 - [The Problem](#the-problem)
 - [How It Works](#how-it-works)

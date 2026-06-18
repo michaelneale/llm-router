@@ -10,9 +10,9 @@ Improvements over the built-in serial `model-router collect`:
 
 Usage:
   .venv/bin/python scripts/collect_fast.py \
-    --config configs/goose-mix.yaml \
-    --questions data/goose-collect.txt \
-    --output data/goose-collected.csv \
+    --config configs/combined-pool.yaml \
+    --questions data/public-prompts.txt \
+    --output data/real-model-labels.csv \
     --judge-model openai/gpt-5-mini \
     --concurrency 8
 """

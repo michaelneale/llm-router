@@ -5,8 +5,8 @@ description: >
   benchmark traces using the actual real provider model pool. Use when someone
   asks to train from HF/public traces, relabel a new model pool, avoid confusing
   fixed-slot remapping, create correctness labels, sweep cost-vs-quality loss,
-  or produce a checkpoint/config for Goose. Do not default to personal Goose
-  session training; that experiment was not the main useful path.
+  or produce a checkpoint/config for Goose. Local agent sessions are for
+  runtime spot checks, not the main training source.
 ---
 
 # Router From Public Traces
@@ -14,10 +14,6 @@ description: >
 Use this skill for the current router workflow in
 `~/Development/nvidia-router/llm-router`: train a cost router from public
 HF/benchmark task traces, using the **actual models we intend to serve**.
-
-The old personalized Goose-session framing is deprecated. Personal sessions can
-be useful as spot checks or future personalization research, but they are not
-the default training source and should not drive the main checkpoint.
 
 ## Non-Negotiable Rule
 
@@ -204,7 +200,6 @@ src/model_router_toolkit/prefill/train.py
 src/model_router_toolkit/prefill/router.py
 scripts/select_router_operating_point.py
 scripts/sweep_verified_tolerances.py
-scripts/tune_tolerance.py
 ```
 
 Serving:
@@ -219,7 +214,7 @@ scripts/router_artifacts.py
 
 - Do not present legacy slot remapping as direct evidence about current real
   provider models.
-- Do not train the main checkpoint on private Goose sessions by default.
+- Do not use local agent transcripts as the main checkpoint training source.
 - Do not optimize for savings alone; report loss on held-out labels.
 - Do not trust the dashboard as a quality signal.
 - Do not add keyword escalation as a substitute for direct labels unless it is

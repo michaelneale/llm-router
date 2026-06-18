@@ -3,7 +3,6 @@
 
 Output: data/swebench-train.csv with columns question,model,isCorrect,output_tokens
 where model = our pool slot names, isCorrect = verified `resolved`.
-Optionally mixes in local goose traces (plausibility-judged) for personalization.
 """
 import json, csv, os
 from collections import defaultdict

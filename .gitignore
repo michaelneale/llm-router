@@ -43,27 +43,24 @@ skills/
 working/
 
 # ---------------------------------------------------------------------------
-# Project-specific: keep the *recipe*, not the private inputs/outputs.
+# Project-specific: keep the recipe, not generated inputs/outputs.
 #
-# We share the code, configs, and scripts that let someone build their OWN
-# personalized router from their OWN goose sessions. We do NOT ship:
-#   - training data derived from private session history (prompts, file paths,
-#     repo names, anything you actually typed to goose)
-#   - large trained checkpoints (binary weights; 15-21 MB each)
+# We share code, configs, and scripts. We do not ship generated datasets,
+# telemetry, large model checkpoints, or local experiment outputs.
 # ---------------------------------------------------------------------------
 
-# Training/eval data derived from personal goose session history.
-# Contains real prompts, paths, repo & PR references — do not publish.
+# Generated training/eval data. Some local workflows may include private prompts
+# or paths, and public trace exports are large/regenerable.
 data/
 
-# Trained router checkpoints (large binaries; personal/benchmark-specific).
+# Trained router checkpoints (large binaries; benchmark/model-pool-specific).
 # Regenerate with `model-router train` or distribute out-of-band (see README).
 checkpoints/*.pt
 checkpoints/*.pkl
 
-# Generated LiteLLM config (derived from goose-mix.yaml via config_bridge).
+# Generated LiteLLM configs. Regenerate from the active pool config.
 # Regenerate with `model-router generate-litellm-config`; uncomment to ignore.
-# configs/litellm-goose.yaml
+# configs/litellm-combined.yaml
 
 # SWE-bench training data + cache (large, regenerable via scripts/pull_swebench_traces.py)
 data/swebench-train*.csv

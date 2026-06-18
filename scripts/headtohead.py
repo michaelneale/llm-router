@@ -8,7 +8,7 @@ and record, per side: which model answered (router picks; Opus is fixed),
 token usage, estimated cost, latency, and the full answer text (for human
 side-by-side quality judging). Writes a JSON report + a readable markdown diff.
 
-Cost is computed from the pool's per-model rates in goose-mix.yaml so the
+Cost is computed from the pool's per-model rates in combined-pool.yaml so the
 router's actual-model cost is comparable to Opus's.
 
 Usage:
@@ -139,7 +139,7 @@ def build_tasks(repo: Path) -> list[dict]:
 def main() -> None:
     ap = argparse.ArgumentParser()
     ap.add_argument("--repo", default=str(Path.home() / "Development/goose"))
-    ap.add_argument("--pool", default="configs/goose-mix.yaml")
+    ap.add_argument("--pool", default="configs/combined-pool.yaml")
     ap.add_argument("--out", default="data/headtohead.json")
     args = ap.parse_args()
 

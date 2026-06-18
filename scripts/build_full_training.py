@@ -17,7 +17,7 @@ offline sweeps can break regret/savings down by general QA vs. code-fixing vs.
 terminal/ops tasks. The train/eval readers ignore unknown columns.
 
 The source matrices are intentionally kept under data_public/ because they are
-external research artifacts, not private Goose traces.
+external research artifacts.
 """
 
 from __future__ import annotations

@@ -6,8 +6,8 @@ pool_config costs with the values from a given config.
 
 Usage: .venv/bin/python scripts/patch_checkpoint_costs.py \
            --src checkpoints/prefill_router_qwen08b.pt \
-           --config configs/goose-mix.yaml \
-           --out checkpoints/prefill_router_goose.pt
+           --config configs/combined-pool.yaml \
+           --out checkpoints/prefill_router_repriced.pt
 """
 
 from __future__ import annotations

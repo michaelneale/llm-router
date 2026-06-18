@@ -12,15 +12,12 @@ They are uploaded to Hugging Face:
 micdn/llm-router-goose-public
 ```
 
-The bundle deliberately excludes `checkpoints/prefill_router_goose.pt`; that was
-a private Goose-session experiment and is not used by `configs/combined-pool.yaml`.
-
 ## Run
 
 ```bash
 python3 -m venv .venv
 . .venv/bin/activate
-pip install -e '.[proxy]'
+pip install -e '.[prefill,proxy,verified-data]'
 
 just run-router
 ```

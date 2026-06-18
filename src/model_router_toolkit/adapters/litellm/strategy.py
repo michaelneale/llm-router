@@ -786,9 +786,9 @@ class ModelRoutingStrategy:
                 return self._litellm_router.model_list[0]
             return {}
 
-        # Policy escalation: sustained-loop / high-stakes prompts that look easy
-        # per-turn but need the top tier for the whole task. Imposed by rule, not
-        # learned — see docs/ROUTING_FINDINGS.md (the "poll CI until done" case).
+        # Policy escalation: explicit hard overrides or configured high-stakes
+        # patterns. Imposed by rule, not learned; the learned trajectory-health
+        # gate is handled separately.
         if self._escalates(text):
             dep = self._find_deployment(self._escalation_model)
             if dep:

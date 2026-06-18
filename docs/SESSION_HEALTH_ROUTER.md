@@ -9,7 +9,7 @@ top tier.
 
 ## Data
 
-The training data is public-HF-only. It does not use Goose sessions.
+The training data comes from public Hugging Face agent trajectories.
 
 Sources:
 

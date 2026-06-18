@@ -118,7 +118,7 @@ def main() -> None:
     for c, n in by.items():
         print(f"  {c:14s}: {n}")
     print(f"\nNext: label by completion (NOT correctness):")
-    print(f"  model-router collect --config configs/goose-mix.yaml \\")
+    print(f"  model-router collect --config configs/combined-pool.yaml \\")
     print(f"    --questions {args.output} --output data/synth-completeness-labels.csv \\")
     print(f"    --judge llm   # then score per class via the meta file")
     print(f"\nJudge rubric to use (see --print-rubric):\n  {JUDGE_RUBRIC[:90]}...")
