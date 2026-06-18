@@ -53,6 +53,9 @@ prefill = [
 proxy = [
     "litellm[proxy]>=1.50,<=1.82.6",
     "packaging>=20.0",
+    "onnxruntime>=1.17",
+    "safetensors>=0.4",
+    "tokenizers>=0.21",
 ]
 verified-data = [
     "pandas>=2.0",

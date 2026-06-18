@@ -14,6 +14,7 @@ if [[ ! -x "$PYTHON" ]]; then
 fi
 
 "$PYTHON" scripts/router_artifacts.py download --repo "$ROUTER_ARTIFACT_REPO"
+"$PYTHON" scripts/router_artifacts.py download-embedding --repo "$ROUTER_ARTIFACT_REPO"
 "$PYTHON" scripts/router_artifacts.py goose-instructions \
   --repo "$ROUTER_ARTIFACT_REPO" \
   --port "$PORT"

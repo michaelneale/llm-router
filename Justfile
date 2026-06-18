@@ -7,6 +7,7 @@ default:
 # Download active public router checkpoints from Hugging Face.
 artifacts:
     @.venv/bin/python scripts/router_artifacts.py download --repo "{{artifact_repo}}"
+    @.venv/bin/python scripts/router_artifacts.py download-embedding --repo "{{artifact_repo}}"
 
 # Print Goose commands for using the router.
 goose-instructions:

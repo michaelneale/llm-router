@@ -24,6 +24,57 @@ tolerance band.
 > launcher downloads public-trace-trained artifacts when they are missing and
 > starts an OpenAI-compatible LiteLLM proxy for Goose or any similar client.
 
+## Try It
+
+```bash
+python3 -m venv .venv
+. .venv/bin/activate
+pip install -e '.[prefill,proxy,verified-data]'
+
+just run-router
+```
+
+`just run-router` downloads the public pretrained router artifacts from
+`micdn/llm-router-goose-public`, regenerates the LiteLLM config, prints Goose
+setup instructions, and starts the proxy at `http://localhost:4000`.
+
+Use the main hidden-state router first:
+
+```bash
+source ./goose-prefill-config      # uses nvidia-routed
+goose
+```
+
+For a lightweight comparison, the same proxy also exposes `embedding-routed`.
+That path uses a public WildChat-trained MiniLM embedding complexity scorer and
+maps its score onto the same provider ladder. It is an alternate training/scoring
+approach, not the main router:
+
+```bash
+source ./goose-embedding-config    # uses embedding-routed
+goose
+```
+
+Quick one-shot comparison:
+
+```bash
+curl -s -X POST http://localhost:4000/savings/reset
+
+source ./goose-prefill-config
+goose run --name prefill-router-smoke -t "Reply with exactly: prefill ready"
+
+source ./goose-embedding-config
+goose run --name embedding-router-smoke -t "Reply with exactly: embedding ready"
+
+curl -s http://localhost:4000/savings | python3 -m json.tool
+```
+
+Expected sanity checks:
+
+- `GET /v1/models` includes `nvidia-routed` and the optional `embedding-routed`
+  comparison alias.
+- The dashboard is at `http://localhost:4000/dashboard`.
+
 <p>
   <img src="docs/img/router-dashboard-overview.jpg" alt="LLM Router live dashboard showing savings, runtime tolerance, cache controls, and routing controls">
 </p>
@@ -107,6 +158,10 @@ The default path is `configs/combined-pool.yaml`:
 - `just run-router` downloads those active artifacts from Hugging Face
   (`micdn/llm-router-goose-public`) when missing, then starts the proxy on port
   `4000`.
+- `embedding-routed` uses a separate embedding-classifier bundle under
+  `~/.goose/complexity_model`. That bundle is trained from 1,000 public WildChat
+  turns labeled by `gpt-4.1` and is published in the same Hugging Face artifact
+  repo.
 
 The current config is intentionally aggressive for real Goose trials:
 
@@ -184,33 +239,9 @@ tier, that can be useful for exploration, but it is not the same as a proper
 retrain. A proper quality claim requires a correctness matrix for the actual
 models being served.
 
-## Run It
-
-```bash
-python3 -m venv .venv
-. .venv/bin/activate
-pip install -e '.[prefill,proxy,verified-data]'
-
-just run-router
-```
-
-`just run-router` downloads the active public artifacts if needed, prints Goose
-setup instructions, regenerates the LiteLLM proxy config from
-`configs/combined-pool.yaml`, and starts the router at `http://localhost:4000`.
-On Apple Silicon, `scripts/run.sh` defaults the local prefill encoder to
-`ROUTER_DEVICE=mps`; set `ROUTER_DEVICE=cpu` or `ROUTER_DEVICE=cuda` to
-override it.
-
-For a quick local restart without the artifact/instruction step, run:
-
-```bash
-./scripts/restart-router.sh
-```
-
 ## Use With Goose
 
-Goose can use a declarative custom provider, which is cleaner than exporting
-`LITELLM_HOST` every time. Create:
+Use a declarative Goose custom provider:
 
 ```text
 ~/.config/goose/custom_providers/router.json
@@ -231,6 +262,10 @@ Goose can use a declarative custom provider, which is cleaner than exporting
     {
       "name": "nvidia-routed",
       "context_limit": 200000
+    },
+    {
+      "name": "embedding-routed",
+      "context_limit": 200000
     }
   ]
 }
@@ -240,6 +275,7 @@ Then run Goose with:
 
 ```bash
 GOOSE_PROVIDER=router GOOSE_MODEL=nvidia-routed goose
+GOOSE_PROVIDER=router GOOSE_MODEL=embedding-routed goose
 ```
 
 The `context_limit` should be the smallest context window of any real model the
@@ -248,22 +284,6 @@ select Anthropic Claude models. Setting it higher would let Goose build a prompt
 that some routed backends cannot accept; setting it lower just compacts earlier
 than necessary. If you change the model pool, update this value to the new safe
 floor.
-
-Point Goose at it without custom config:
-
-```bash
-LITELLM_HOST=http://localhost:4000 LITELLM_API_KEY=sk-local GOOSE_CONTEXT_LIMIT=200000 \
-GOOSE_PROVIDER=litellm GOOSE_MODEL=nvidia-routed \
-goose
-```
-
-One-shot:
-
-```bash
-LITELLM_HOST=http://localhost:4000 LITELLM_API_KEY=sk-local GOOSE_CONTEXT_LIMIT=200000 \
-GOOSE_PROVIDER=litellm GOOSE_MODEL=nvidia-routed \
-goose run --name routed-task -t "<your task>"
-```
 
 ## Dashboard And API
 

@@ -19,7 +19,6 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import Any
 
-
 DEFAULT_REPO = "micdn/llm-router-goose-public"
 
 
@@ -28,6 +27,21 @@ class Artifact:
     path: str
     description: str
     required_for_runtime: bool = True
+    runtime_mode: str = "default"
+
+
+EMBEDDING_BUNDLE_PREFIX = "embedding/complexity_model"
+EMBEDDING_BUNDLE_FILES = [
+    "config.json",
+    "embedder.onnx",
+    "embedder_hf_config.json",
+    "eval_report.md",
+    "parity_fixture.jsonl",
+    "special_tokens_map.json",
+    "tokenizer.json",
+    "tokenizer_config.json",
+    "weights.safetensors",
+]
 
 
 ARTIFACTS = [
@@ -54,6 +68,17 @@ ARTIFACTS = [
         "Session-health training and runtime notes.",
         required_for_runtime=False,
     ),
+    *[
+        Artifact(
+            f"{EMBEDDING_BUNDLE_PREFIX}/{name}",
+            "Optional embedding-router bundle trained from public WildChat traces."
+            if name == "config.json"
+            else "Optional embedding-router bundle file.",
+            required_for_runtime=False,
+            runtime_mode="embedding",
+        )
+        for name in EMBEDDING_BUNDLE_FILES
+    ],
 ]
 
 RUNTIME_ARTIFACTS = [artifact for artifact in ARTIFACTS if artifact.required_for_runtime]
@@ -72,6 +97,17 @@ def token() -> str:
     )
 
 
+def embedding_bundle_dir() -> Path:
+    return Path(os.environ.get("ROUTER_EMBEDDING_BUNDLE", "~/.goose/complexity_model")).expanduser()
+
+
+def local_path_for_artifact(artifact: Artifact) -> Path:
+    prefix = f"{EMBEDDING_BUNDLE_PREFIX}/"
+    if artifact.path.startswith(prefix):
+        return embedding_bundle_dir() / artifact.path[len(prefix) :]
+    return Path(artifact.path)
+
+
 def sha256(path: Path) -> str:
     digest = hashlib.sha256()
     with path.open("rb") as f:
@@ -80,27 +116,37 @@ def sha256(path: Path) -> str:
     return digest.hexdigest()
 
 
-def file_info(path: Path, description: str, *, required_for_runtime: bool) -> dict[str, Any]:
+def file_info(
+    local_path: Path,
+    remote_path: str,
+    description: str,
+    *,
+    required_for_runtime: bool,
+    runtime_mode: str,
+) -> dict[str, Any]:
     return {
-        "path": path.as_posix(),
-        "size_bytes": path.stat().st_size,
-        "sha256": sha256(path),
+        "path": remote_path,
+        "size_bytes": local_path.stat().st_size,
+        "sha256": sha256(local_path),
         "description": description,
         "required_for_runtime": required_for_runtime,
+        "runtime_mode": runtime_mode,
     }
 
 
 def build_manifest(repo_id: str) -> dict[str, Any]:
     artifacts = []
     for artifact in ARTIFACTS:
-        path = Path(artifact.path)
+        path = local_path_for_artifact(artifact)
         if not path.exists():
-            raise SystemExit(f"missing artifact: {artifact.path}")
+            raise SystemExit(f"missing artifact: {artifact.path} (local {path})")
         artifacts.append(
             file_info(
                 path,
+                artifact.path,
                 artifact.description,
                 required_for_runtime=artifact.required_for_runtime,
+                runtime_mode=artifact.runtime_mode,
             )
         )
     return {
@@ -114,7 +160,8 @@ def build_manifest(repo_id: str) -> dict[str, Any]:
 
 def model_card(manifest: dict[str, Any]) -> str:
     files = "\n".join(
-        f"- `{item['path']}` ({item['size_bytes'] / 1024 / 1024:.2f} MiB): "
+        f"- `{item['path']}` ({item.get('runtime_mode', 'default')}, "
+        f"{item['size_bytes'] / 1024 / 1024:.2f} MiB): "
         f"{item['description']}"
         for item in manifest["artifacts"]
     )
@@ -143,6 +190,9 @@ Public artifact bundle for the public-trace LLM router branch.
 - `session_health_public.pkl` is the active v2 session-health checkpoint. Its
   embedded report points at `data_public/session-health-windows-v2.csv`, built
   from public SWE-bench and TerminalBench Hugging Face traces.
+- `embedding/complexity_model/` is the optional embedding-router classifier bundle
+  trained from public WildChat conversations labeled by an OpenAI judge. It is
+  used only when routing through the `embedding-routed` alias.
 
 ## Use
 
@@ -156,7 +206,7 @@ just goose-instructions
 Or directly:
 
 ```bash
-ROUTER_ARTIFACT_REPO={manifest['repo_id']} ./scripts/run-public-router.sh
+ROUTER_ARTIFACT_REPO={manifest["repo_id"]} ./scripts/run-public-router.sh
 ```
 
 The session-health checkpoint is a trusted Python pickle. Do not load arbitrary
@@ -186,8 +236,14 @@ def fetch_json(repo_id: str, path: str) -> dict[str, Any] | None:
         raise
 
 
-def download_file(repo_id: str, path: str, expected_sha256: str | None = None) -> None:
-    out = Path(path)
+def download_file(
+    repo_id: str,
+    path: str,
+    expected_sha256: str | None = None,
+    *,
+    out_path: Path | None = None,
+) -> None:
+    out = out_path or Path(path)
     if out.exists() and expected_sha256 and sha256(out) == expected_sha256:
         print(f"ok      {path}")
         return
@@ -209,19 +265,46 @@ def download_file(repo_id: str, path: str, expected_sha256: str | None = None) -
         tmp.unlink(missing_ok=True)
         raise SystemExit(f"checksum mismatch for {path}")
     os.replace(tmp, out)
-    print(f"wrote   {path}")
+    if out.as_posix() == path:
+        print(f"wrote   {path}")
+    else:
+        print(f"wrote   {path} -> {out}")
 
 
-def download(repo_id: str) -> None:
+def artifacts_for_mode(mode: str) -> list[Artifact]:
+    if mode == "all":
+        return ARTIFACTS
+    if mode == "embedding":
+        return [artifact for artifact in ARTIFACTS if artifact.runtime_mode == "embedding"]
+    return RUNTIME_ARTIFACTS
+
+
+def remote_info_for_artifact(
+    expected: dict[str, dict[str, Any]], artifact: Artifact
+) -> tuple[str, dict[str, Any]]:
+    info = expected.get(artifact.path)
+    if info:
+        return artifact.path, info
+    prefix = f"{EMBEDDING_BUNDLE_PREFIX}/"
+    if artifact.path.startswith(prefix):
+        legacy_path = f"{LEGACY_EMBEDDING_BUNDLE_PREFIX}/" + artifact.path[len(prefix) :]
+        info = expected.get(legacy_path)
+        if info:
+            return legacy_path, info
+    return artifact.path, {}
+
+
+def download(repo_id: str, *, mode: str = "default") -> None:
     manifest = fetch_json(repo_id, "artifact-manifest.json")
-    expected = {
-        item["path"]: item
-        for item in (manifest or {}).get("artifacts", [])
-        if item.get("required_for_runtime")
-    }
-    for artifact in RUNTIME_ARTIFACTS:
-        info = expected.get(artifact.path, {})
-        download_file(repo_id, artifact.path, info.get("sha256"))
+    expected = {item["path"]: item for item in (manifest or {}).get("artifacts", [])}
+    for artifact in artifacts_for_mode(mode):
+        remote_path, info = remote_info_for_artifact(expected, artifact)
+        download_file(
+            repo_id,
+            remote_path,
+            info.get("sha256"),
+            out_path=local_path_for_artifact(artifact),
+        )
 
 
 def upload(repo_id: str, *, private: bool) -> None:
@@ -242,7 +325,10 @@ def upload(repo_id: str, *, private: bool) -> None:
         card_path.write_text(model_card(manifest))
 
         upload_items = [(manifest_path, "artifact-manifest.json"), (card_path, "README.md")]
-        upload_items.extend((Path(item["path"]), item["path"]) for item in manifest["artifacts"])
+        upload_items.extend(
+            (local_path_for_artifact(Artifact(item["path"], item["description"])), item["path"])
+            for item in manifest["artifacts"]
+        )
 
         for local_path, remote_path in upload_items:
             print(f"upload {remote_path}")
@@ -263,7 +349,7 @@ def goose_instructions(port: int, repo_id: str) -> None:
             Router URL: http://localhost:{port}
             Dashboard:  http://localhost:{port}/dashboard
 
-            Start the router:
+            Run the router:
 
               just run-router
 
@@ -279,22 +365,30 @@ def goose_instructions(port: int, repo_id: str) -> None:
                 "requires_auth": false,
                 "supports_streaming": true,
                 "timeout_seconds": 600,
-                "models": [{{"name": "nvidia-routed", "context_limit": 200000}}]
+                "models": [
+                  {{"name": "nvidia-routed", "context_limit": 200000}},
+                  {{"name": "embedding-routed", "context_limit": 200000}}
+                ]
               }}
 
               GOOSE_PROVIDER=router GOOSE_MODEL=nvidia-routed goose
+              GOOSE_PROVIDER=router GOOSE_MODEL=embedding-routed goose
 
-            Env-only Goose fallback, one-shot:
+            Quick one-shot comparison:
 
-              cd <repo-you-want-goose-to-work-on>
-              LITELLM_HOST=http://localhost:{port} LITELLM_API_KEY=sk-local GOOSE_CONTEXT_LIMIT=200000 \\
-              GOOSE_PROVIDER=litellm GOOSE_MODEL=nvidia-routed \\
-              goose run --name routed-task -t "<your task>"
+              curl -s -X POST http://localhost:{port}/savings/reset
+              source ./goose-prefill-config
+              goose run --name prefill-router-smoke -t "Reply with exactly: prefill ready"
+              source ./goose-embedding-config
+              goose run --name embedding-router-smoke -t "Reply with exactly: embedding ready"
+              curl -s http://localhost:{port}/savings | python3 -m json.tool
 
-            Env-only Goose fallback, interactive:
+            Interactive Goose:
 
-              LITELLM_HOST=http://localhost:{port} LITELLM_API_KEY=sk-local GOOSE_CONTEXT_LIMIT=200000 \\
-              GOOSE_PROVIDER=litellm GOOSE_MODEL=nvidia-routed \\
+              source ./goose-prefill-config
+              goose
+
+              source ./goose-embedding-config
               goose
 
             Force top tier for a run:
@@ -304,6 +398,7 @@ def goose_instructions(port: int, repo_id: str) -> None:
             Check routing/savings:
 
               curl -s http://localhost:{port}/savings | python3 -m json.tool
+
             """
         ).strip()
     )
@@ -315,19 +410,49 @@ def main() -> None:
 
     download_parser = sub.add_parser("download", help="download active runtime checkpoints")
     download_parser.add_argument("--repo", default=None, help=f"HF repo id; default {DEFAULT_REPO}")
+    download_parser.add_argument(
+        "--mode",
+        choices=["default", "embedding", "all"],
+        default="default",
+        help="artifact set to download; default skips optional embedding bundle",
+    )
+
+    download_embedding_parser = sub.add_parser(
+        "download-embedding",
+        help="download optional embedding-router bundle",
+    )
+    download_embedding_parser.add_argument(
+        "--repo",
+        default=None,
+        help=f"HF repo id; default {DEFAULT_REPO}",
+    )
 
     upload_parser = sub.add_parser("upload", help="upload active public artifacts")
-    upload_parser.add_argument("--private", action="store_true", help="create/update a private repo")
+    upload_parser.add_argument(
+        "--private",
+        action="store_true",
+        help="create/update a private repo",
+    )
     upload_parser.add_argument("--repo", default=None, help=f"HF repo id; default {DEFAULT_REPO}")
 
     instructions_parser = sub.add_parser("goose-instructions", help="print Goose setup commands")
-    instructions_parser.add_argument("--port", type=int, default=int(os.environ.get("PORT", "4000")))
-    instructions_parser.add_argument("--repo", default=None, help=f"HF repo id; default {DEFAULT_REPO}")
+    instructions_parser.add_argument(
+        "--port",
+        type=int,
+        default=int(os.environ.get("PORT", "4000")),
+    )
+    instructions_parser.add_argument(
+        "--repo",
+        default=None,
+        help=f"HF repo id; default {DEFAULT_REPO}",
+    )
 
     args = parser.parse_args()
     repo_id = repo_from_args(getattr(args, "repo", None))
     if args.command == "download":
-        download(repo_id)
+        download(repo_id, mode=args.mode)
+    elif args.command == "download-embedding":
+        download(repo_id, mode="embedding")
     elif args.command == "upload":
         upload(repo_id, private=args.private)
     elif args.command == "goose-instructions":

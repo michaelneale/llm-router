@@ -26,7 +26,6 @@ import yaml
 
 from model_router_toolkit.config import load_config
 
-
 DB_DEFAULT = Path.home() / ".local/share/goose/sessions/sessions.db"
 
 
@@ -69,7 +68,11 @@ def split_litellm_model(value: str) -> tuple[str, str]:
     return provider, model
 
 
-def check_pool_inventory(config_path: str, inventory: dict[str, set[str]], failures: list[str]) -> None:
+def check_pool_inventory(
+    config_path: str,
+    inventory: dict[str, set[str]],
+    failures: list[str],
+) -> None:
     cfg = load_config(config_path)
     if not inventory:
         warn("Skipping provider inventory checks because no inventory was loaded.")
@@ -91,7 +94,10 @@ def check_pool_inventory(config_path: str, inventory: dict[str, set[str]], failu
             missing.append(f"{model.name} -> {litellm_model}")
 
     if missing:
-        fail("pool maps slots to model IDs absent from Goose inventory: " + "; ".join(missing), failures)
+        fail(
+            "pool maps slots to model IDs absent from Goose inventory: " + "; ".join(missing),
+            failures,
+        )
     else:
         ok("all OpenAI/Anthropic pool mappings appear in Goose provider inventory")
 
@@ -105,9 +111,11 @@ def check_litellm_config(pool_path: str, litellm_path: str, failures: list[str])
         fail(f"could not read LiteLLM config {litellm_path}: {exc}", failures)
         return
 
+    routed_aliases = {"nvidia-routed", "embedding-routed"}
     actual = {
         row.get("model_name"): (row.get("litellm_params") or {}).get("model")
         for row in data.get("model_list", [])
+        if row.get("model_name") not in routed_aliases
     }
     expected = {m.name: m.litellm_model for m in pool.models}
     drift = [
@@ -123,11 +131,15 @@ def check_litellm_config(pool_path: str, litellm_path: str, failures: list[str])
     else:
         ok("LiteLLM config model mappings match pool config")
 
-    aliases = (data.get("router_settings") or {}).get("model_group_alias") or {}
-    if "nvidia-routed" not in aliases:
-        warn("LiteLLM config has no nvidia-routed model_group_alias")
+    exposed = {row.get("model_name") for row in data.get("model_list", [])}
+    if "nvidia-routed" not in exposed:
+        warn("LiteLLM config does not expose nvidia-routed")
     else:
-        ok("LiteLLM config exposes nvidia-routed alias")
+        ok("LiteLLM config exposes nvidia-routed")
+    if "embedding-routed" not in exposed:
+        warn("LiteLLM config does not expose embedding-routed")
+    else:
+        ok("LiteLLM config exposes embedding-routed")
 
 
 def check_local_base_url(port: int, failures: list[str]) -> None:
@@ -183,14 +195,18 @@ def check_live_proxy(
 ) -> None:
     cfg = load_config(config_path)
     trial_tolerance = float(cfg.routing.tolerance)
-    cheapest = min(
-        cfg.models,
-        key=lambda model: (
-            model.cost_per_m_input_tokens,
-            model.cost_per_m_output_tokens,
-            model.name,
-        ),
-    ).name if cfg.models else ""
+    cheapest = (
+        min(
+            cfg.models,
+            key=lambda model: (
+                model.cost_per_m_input_tokens,
+                model.cost_per_m_output_tokens,
+                model.name,
+            ),
+        ).name
+        if cfg.models
+        else ""
+    )
 
     models = fetch_json(f"{base_url.rstrip('/')}/v1/models", timeout)
     if models is None:
@@ -204,7 +220,10 @@ def check_live_proxy(
 
     savings = fetch_json(f"{base_url.rstrip('/')}/savings", timeout)
     if savings is None:
-        fail(f"live proxy savings endpoint is not reachable at {base_url.rstrip('/')}/savings", failures)
+        fail(
+            f"live proxy savings endpoint is not reachable at {base_url.rstrip('/')}/savings",
+            failures,
+        )
         return
     if not savings.get("baseline_model"):
         fail("live proxy /savings has no baseline_model", failures)

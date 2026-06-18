@@ -34,8 +34,7 @@ def _routing_cost_blend(model: Any, output_token_weight: float) -> float:
     return round(
         (
             float(getattr(model, "cost_per_m_input_tokens", 0.0) or 0.0)
-            + output_token_weight
-            * float(getattr(model, "cost_per_m_output_tokens", 0.0) or 0.0)
+            + output_token_weight * float(getattr(model, "cost_per_m_output_tokens", 0.0) or 0.0)
         )
         * multiplier,
         6,
@@ -58,9 +57,7 @@ def _model_knob(model: Any, output_token_weight: float) -> dict[str, Any]:
         "litellm_model": provider_model,
         "input_cost": float(getattr(model, "cost_per_m_input_tokens", 0.0) or 0.0),
         "output_cost": float(getattr(model, "cost_per_m_output_tokens", 0.0) or 0.0),
-        "routing_cost_multiplier": float(
-            getattr(model, "routing_cost_multiplier", 1.0) or 1.0
-        ),
+        "routing_cost_multiplier": float(getattr(model, "routing_cost_multiplier", 1.0) or 1.0),
         "routing_blend": _routing_cost_blend(model, output_token_weight),
     }
 
@@ -163,9 +160,7 @@ def _build_routing_knobs(
     by_slot = {slot: knob for slot, knob in models_with_slots}
     top_slot = getattr(escalation, "top_tier_model", "") if escalation else ""
 
-    switching_disabled = _env_truthy("ROUTER_DISABLE_SWITCHING") or _env_falsey(
-        "ROUTER_SWITCHING"
-    )
+    switching_disabled = _env_truthy("ROUTER_DISABLE_SWITCHING") or _env_falsey("ROUTER_SWITCHING")
     switching_configured = bool(getattr(switching, "enabled", False))
     cache_pin_mode = os.environ.get(
         "ROUTER_CACHE_PINNING",
@@ -201,9 +196,7 @@ def _build_routing_knobs(
             "disabled_by_env": switching_disabled,
             "up_margin": float(getattr(switching, "up_margin", 0.0) or 0.0),
             "down_margin": float(getattr(switching, "down_margin", 0.0) or 0.0),
-            "down_margin_per_100k": float(
-                getattr(switching, "down_margin_per_100k", 0.0) or 0.0
-            ),
+            "down_margin_per_100k": float(getattr(switching, "down_margin_per_100k", 0.0) or 0.0),
             "max_down_margin": float(getattr(switching, "max_down_margin", 0.0) or 0.0),
         },
         "cache_pinning": {
@@ -215,9 +208,7 @@ def _build_routing_knobs(
         "top_tier": by_slot.get(top_slot),
         "manual_override": "!hard" if any("!hard" in p for p in patterns) else "",
         "session_health": {
-            "configured": bool(
-                session_health and getattr(session_health, "enabled", False)
-            ),
+            "configured": bool(session_health and getattr(session_health, "enabled", False)),
             "checkpoint": (
                 str(getattr(session_health, "checkpoint", "")) if session_health else ""
             ),
@@ -236,9 +227,7 @@ def _build_routing_knobs(
         },
         "escalation_patterns": patterns,
         "cheap_patterns": (
-            list(getattr(utility, "cheap_when_prompt_matches", []) or [])
-            if utility
-            else []
+            list(getattr(utility, "cheap_when_prompt_matches", []) or []) if utility else []
         ),
         "models": _public_model_ladder(models_with_slots),
     }
@@ -327,11 +316,10 @@ def start_proxy(
 
     os.environ["CONFIG_FILE_PATH"] = litellm_config
 
+    from litellm.proxy.proxy_server import app as litellm_app
     from starlette.middleware.base import BaseHTTPMiddleware
     from starlette.requests import Request
     from starlette.responses import Response
-
-    from litellm.proxy.proxy_server import app as litellm_app
 
     from model_router_toolkit.adapters.litellm.savings import (
         extract_usage,
@@ -354,17 +342,13 @@ def start_proxy(
 
         _pool = load_config(router_config_abs)
         model_display_names = {
-            m.name: (m.display_name or m.litellm_model or m.name)
-            for m in _pool.models
+            m.name: (m.display_name or m.litellm_model or m.name) for m in _pool.models
         }
         tracker.set_display_names(
             {m.name: (m.litellm_model or m.display_name or m.name) for m in _pool.models}
         )
         tracker.set_model_rates(
-            {
-                m.name: (m.cost_per_m_input_tokens, m.cost_per_m_output_tokens)
-                for m in _pool.models
-            }
+            {m.name: (m.cost_per_m_input_tokens, m.cost_per_m_output_tokens) for m in _pool.models}
         )
         routing_knobs = _build_routing_knobs(
             _pool,
@@ -397,8 +381,12 @@ def start_proxy(
 
     import json as _json
 
-    _COMPLETION_PATHS = ("/chat/completions", "/completions", "/v1/chat/completions",
-                         "/v1/completions")
+    _COMPLETION_PATHS = (
+        "/chat/completions",
+        "/completions",
+        "/v1/chat/completions",
+        "/v1/completions",
+    )
 
     def _content_text(content) -> str:
         if isinstance(content, str):
@@ -447,8 +435,7 @@ def start_proxy(
                 if new_raw != raw:
                     # Re-serve the (possibly modified) body to downstream handlers.
                     async def _receive():
-                        return {"type": "http.request", "body": new_raw,
-                                "more_body": False}
+                        return {"type": "http.request", "body": new_raw, "more_body": False}
 
                     request = Request(request.scope, _receive)
 
@@ -549,6 +536,8 @@ def start_proxy(
         request_id = str(metadata.get("router_request_id") or uuid.uuid4().hex)
         metadata["router_request_id"] = request_id
         metadata.setdefault("router_session_id", _router_session_id(data.get("messages")))
+        if str(data.get("model") or "") == "embedding-routed":
+            metadata["router_mode"] = "embedding"
         data["metadata"] = metadata
         data["litellm_metadata"] = dict(metadata)
 
@@ -581,8 +570,7 @@ def start_proxy(
         cache_pinning = dict(knobs.get("cache_pinning") or {})
         cache_pinning["mode"] = getattr(strategy, "cache_pin_mode", "off")
         cache_pinning["min_blend"] = float(
-            getattr(strategy, "cache_pin_min_blend", cache_pinning.get("min_blend", 3.0))
-            or 0.0
+            getattr(strategy, "cache_pin_min_blend", cache_pinning.get("min_blend", 3.0)) or 0.0
         )
         cache_pinning.setdefault("recommended_modes", _cache_pin_modes())
         knobs["cache_pinning"] = cache_pinning

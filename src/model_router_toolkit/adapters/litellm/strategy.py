@@ -32,6 +32,11 @@ from model_router_toolkit.task_view import (
 
 logger = logging.getLogger(__name__)
 
+EMBEDDING_ROUTED_ALIAS = "embedding-routed"
+EMBEDDING_COMPLEXITY_BANDS = (0.15, 0.35, 0.55, 0.75)
+SESSION_HEALTH_MIN_EVENTS = 4
+SESSION_HEALTH_MIN_AGENTIC_EVENTS = 2
+
 _request_tolerance: contextvars.ContextVar[float | None] = contextvars.ContextVar(
     "request_tolerance",
     default=None,
@@ -134,14 +139,12 @@ class ModelRoutingStrategy:
         # Policy escalation overlay: force the top tier when the prompt matches
         # (sustained agentic loops the prefill encoder can't see, or !hard).
         self._escalation_model = escalation_model
-        self._escalation_res = [
-            _re.compile(p, _re.IGNORECASE) for p in (escalation_patterns or [])
-        ]
-        self._cheap_res = [
-            _re.compile(p, _re.IGNORECASE) for p in (cheap_patterns or [])
-        ]
+        self._escalation_res = [_re.compile(p, _re.IGNORECASE) for p in (escalation_patterns or [])]
+        self._cheap_res = [_re.compile(p, _re.IGNORECASE) for p in (cheap_patterns or [])]
         self._route_log_path = os.environ.get("ROUTER_ROUTE_LOG", "")
         self._route_log_lock = threading.Lock()
+        self._embedding_scorer: Any = None
+        self._embedding_load_error: Exception | None = None
 
     @classmethod
     def from_config(cls, config_path: str, **kwargs: Any) -> ModelRoutingStrategy:
@@ -171,9 +174,7 @@ class ModelRoutingStrategy:
         return cls(router, **kwargs)
 
     def _escalates(self, text: str) -> bool:
-        return bool(self._escalation_model) and any(
-            r.search(text) for r in self._escalation_res
-        )
+        return bool(self._escalation_model) and any(r.search(text) for r in self._escalation_res)
 
     def _cheap_utility(self, text: str) -> bool:
         return any(r.search(text) for r in self._cheap_res)
@@ -300,9 +301,7 @@ class ModelRoutingStrategy:
             if result is None:
                 continue
             cost = result.selected_cost
-            candidates.append(
-                (cost.cost_per_m_input_tokens, cost.cost_per_m_output_tokens, name)
-            )
+            candidates.append((cost.cost_per_m_input_tokens, cost.cost_per_m_output_tokens, name))
         if not candidates:
             return None
         return min(candidates)[2]
@@ -317,9 +316,7 @@ class ModelRoutingStrategy:
             if result is None:
                 continue
             cost = result.selected_cost
-            candidates.append(
-                (cost.cost_per_m_input_tokens, cost.cost_per_m_output_tokens, name)
-            )
+            candidates.append((cost.cost_per_m_input_tokens, cost.cost_per_m_output_tokens, name))
         if not candidates:
             return None
         return max(candidates)[2]
@@ -340,8 +337,7 @@ class ModelRoutingStrategy:
         }:
             return True
         return bool(
-            self._session_health_config
-            and getattr(self._session_health_config, "enabled", False)
+            self._session_health_config and getattr(self._session_health_config, "enabled", False)
         )
 
     def _session_health_top_model(self, allowed: list[str] | None = None) -> str | None:
@@ -370,8 +366,45 @@ class ModelRoutingStrategy:
             logger.exception("Session-health scoring failed")
             return None
         score.threshold = self._session_health_threshold
-        score.should_escalate = score.score >= self._session_health_threshold
+        score.should_escalate = (
+            score.score >= self._session_health_threshold
+            and self._session_health_has_actionable_history(score)
+        )
         return score
+
+    def _session_health_has_actionable_history(self, score: Any) -> bool:
+        features = getattr(score, "features", None) or {}
+
+        def value(name: str) -> float:
+            try:
+                return float(features.get(name, 0.0) or 0.0)
+            except (TypeError, ValueError):
+                return 0.0
+
+        event_count = value("event_count")
+        assistant_count = value("assistant_count")
+        tool_count = value("tool_count")
+        command_count = value("command_count")
+        error_count = value("error_count")
+        retry_count = value("retry_count")
+        repeated_error_recent = value("repeated_error_recent")
+        test_failure_recent = value("test_failure_recent")
+
+        if event_count < SESSION_HEALTH_MIN_EVENTS:
+            return False
+        if assistant_count + tool_count < SESSION_HEALTH_MIN_AGENTIC_EVENTS:
+            return False
+        return any(
+            signal > 0
+            for signal in (
+                tool_count,
+                command_count,
+                error_count,
+                retry_count,
+                repeated_error_recent,
+                test_failure_recent,
+            )
+        )
 
     def _select_utility_model(
         self,
@@ -422,6 +455,11 @@ class ModelRoutingStrategy:
         rid = metadata.get("router_request_id")
         return str(rid) if rid else None
 
+    def _is_embedding_request(self, model: str, request_kwargs: dict | None) -> bool:
+        metadata = self._metadata(request_kwargs)
+        mode = str(metadata.get("router_mode") or "").lower()
+        return model == EMBEDDING_ROUTED_ALIAS or mode == "embedding"
+
     def _session_key(
         self,
         messages: list[dict] | None,
@@ -470,6 +508,118 @@ class ModelRoutingStrategy:
             if request_id:
                 self._results_by_request[request_id] = result
 
+    def _get_embedding_scorer(self):
+        if self._embedding_scorer is not None:
+            return self._embedding_scorer
+        if self._embedding_load_error is not None:
+            raise RuntimeError(
+                "Embedding-router scorer failed to load earlier"
+            ) from self._embedding_load_error
+        try:
+            from model_router_toolkit.adapters.litellm.embedding import (
+                EmbeddingComplexityScorer,
+            )
+
+            bundle = os.environ.get("ROUTER_EMBEDDING_BUNDLE", "")
+            self._embedding_scorer = EmbeddingComplexityScorer(bundle or None)
+            return self._embedding_scorer
+        except Exception as exc:
+            self._embedding_load_error = exc
+            raise
+
+    def _embedding_ladder(self, allowed: list[str] | None) -> list[str]:
+        allowed_set = set(allowed) if allowed else None
+        candidates: list[tuple[tuple[float, float], str]] = []
+        seen_costs: set[tuple[float, float]] = set()
+        for name in self._pool_model_names():
+            if allowed_set is not None and name not in allowed_set:
+                continue
+            result = self._router.resolve(name)
+            if result is None:
+                continue
+            cost = result.selected_cost
+            cost_key = (cost.cost_per_m_input_tokens, cost.cost_per_m_output_tokens)
+            if cost_key in seen_costs:
+                continue
+            seen_costs.add(cost_key)
+            candidates.append((cost_key, name))
+        candidates.sort(key=lambda item: item[0])
+        return [name for _, name in candidates]
+
+    def _select_embedding_ladder_model(
+        self, complexity: float, allowed: list[str] | None
+    ) -> str | None:
+        ladder = self._embedding_ladder(allowed)
+        if not ladder:
+            return None
+        if len(ladder) == len(EMBEDDING_COMPLEXITY_BANDS) + 1:
+            idx = 0
+            for threshold in EMBEDDING_COMPLEXITY_BANDS:
+                if complexity < threshold:
+                    break
+                idx += 1
+        else:
+            idx = int(max(0.0, min(0.999999, complexity)) * len(ladder))
+        return ladder[min(idx, len(ladder) - 1)]
+
+    def _route_embedding(
+        self,
+        *,
+        request_id: str | None,
+        session_key: str,
+        messages: list[dict] | None,
+        request_kwargs: dict | None,
+        allowed: list[str] | None,
+    ) -> dict | None:
+        router_mode = "embedding"
+        decision = "embedding_route"
+        error: str | None = None
+        try:
+            score = self._get_embedding_scorer().score_messages(messages)
+            selected = self._select_embedding_ladder_model(score.complexity, allowed)
+            if not selected:
+                return None
+            task_view = score.rendered
+            ladder = self._embedding_ladder(allowed)
+            metadata = {
+                "router_mode": router_mode,
+                "complexity": round(float(score.complexity), 4),
+                "tool_calls_norm": round(float(score.tool_calls_norm), 4),
+                "elapsed_ms": int(score.elapsed_ms),
+                "ladder": ladder,
+            }
+        except Exception as exc:
+            logger.exception("Embedding routing failed; falling back to dearest model")
+            selected = self._dearest_model(allowed)
+            if not selected:
+                return None
+            task_view = self._extract_user_text(messages)
+            decision = "embedding_fallback_main"
+            error = str(exc)
+            metadata = {
+                "router_mode": router_mode,
+                "ladder": self._embedding_ladder(allowed),
+                "error": error[:300],
+            }
+
+        result = self._router.resolve(selected)
+        if result is None:
+            return None
+        result.metadata.update(metadata)
+        self._store_result(request_id, result)
+        self._set_last_selected(session_key, selected)
+        self._log_route(
+            request_id=request_id,
+            session_key=session_key,
+            decision=decision,
+            result=result,
+            task_view=task_view,
+            messages=messages,
+            extra={"router_mode": router_mode, "embedding_error": error},
+        )
+        logger.info("Embedding route -> %s (%s)", selected, result.metadata)
+        return self._find_deployment(selected)
+
     def _switching_enabled(self) -> bool:
         sw = self._switching
         if os.environ.get("ROUTER_DISABLE_SWITCHING", "").lower() in {"1", "true", "yes", "on"}:
@@ -484,15 +634,10 @@ class ModelRoutingStrategy:
             spec = config.get_model(model_name) if hasattr(config, "get_model") else None
             if spec is not None:
                 routing = getattr(config, "routing", None)
-                output_weight = float(
-                    getattr(routing, "output_token_weight", 0.0) or 0.0
-                )
-                multiplier = float(
-                    getattr(spec, "routing_cost_multiplier", 1.0) or 1.0
-                )
+                output_weight = float(getattr(routing, "output_token_weight", 0.0) or 0.0)
+                multiplier = float(getattr(spec, "routing_cost_multiplier", 1.0) or 1.0)
                 return (
-                    spec.cost_per_m_input_tokens
-                    + output_weight * spec.cost_per_m_output_tokens
+                    spec.cost_per_m_input_tokens + output_weight * spec.cost_per_m_output_tokens
                 ) * multiplier
 
         resolved = self._router.resolve(model_name)
@@ -611,7 +756,11 @@ class ModelRoutingStrategy:
         # not worth leaving the cached incumbent — stay put
         logger.info(
             "Switch gate: stay on %s (cand %s gain %.3f < margin %.3f, %s)",
-            cur, cand, gain, margin, "down" if going_down else "up",
+            cur,
+            cand,
+            gain,
+            margin,
+            "down" if going_down else "up",
         )
         meta = dict(result.metadata)
         meta["switch_gate"] = {
@@ -711,6 +860,8 @@ class ModelRoutingStrategy:
     ) -> dict:
         request_id = self._request_id(request_kwargs)
         session_key = self._session_key(messages, request_kwargs)
+        req_models = self._metadata(request_kwargs).get("models")
+        allowed = req_models or self._models
 
         # Explicit pin via metadata — for router-per-subagent flows.
         dep = self._try_pin(
@@ -728,8 +879,6 @@ class ModelRoutingStrategy:
         # blindly pinning to the incumbent; optional cache-pin modes can preserve
         # the incumbent only for dear models, or for every model.
         raw_text = self._extract_user_text(messages).strip()
-        req_models = self._metadata(request_kwargs).get("models")
-        allowed = req_models or self._models
 
         if is_goose_title_request(raw_text):
             dep = self._select_utility_model(
@@ -756,23 +905,27 @@ class ModelRoutingStrategy:
             if dep is not None:
                 return dep
 
+        if is_info_only_request(raw_text):
+            pinned = self._pin_to_last(session_key, request_id, messages, "")
+            if pinned is not None:
+                return pinned
+            dep = self._select_utility_model(
+                session_key=session_key,
+                request_id=request_id,
+                messages=messages,
+                task_view=raw_text,
+                reason="goose_info_only",
+                remember=True,
+                allowed=allowed,
+            )
+            if dep is not None:
+                return dep
+
         text = build_task_view(messages)
         if text is None:
             pinned = self._pin_to_last(session_key, request_id, messages, "")
             if pinned is not None:
                 return pinned
-            if is_info_only_request(raw_text):
-                dep = self._select_utility_model(
-                    session_key=session_key,
-                    request_id=request_id,
-                    messages=messages,
-                    task_view=raw_text,
-                    reason="goose_info_only",
-                    remember=True,
-                    allowed=allowed,
-                )
-                if dep is not None:
-                    return dep
             # no prior decision yet (cold session opening on a tool turn) — fall
             # back to bare extraction so we still route something sensible.
             text = self._extract_user_text(messages)
@@ -821,9 +974,7 @@ class ModelRoutingStrategy:
                 result.metadata["session_health"] = {
                     "score": round(float(health.score), 4),
                     "threshold": round(float(health.threshold), 4),
-                    "features": {
-                        k: round(float(v), 4) for k, v in health.features.items()
-                    },
+                    "features": {k: round(float(v), 4) for k, v in health.features.items()},
                 }
                 self._set_last_selected(session_key, model_name)
                 self._store_result(request_id, result)
@@ -854,6 +1005,17 @@ class ModelRoutingStrategy:
                 "session_health_score": round(float(health.score), 4),
                 "session_health_threshold": round(float(health.threshold), 4),
             }
+
+        if self._is_embedding_request(model, request_kwargs):
+            dep = self._route_embedding(
+                request_id=request_id,
+                session_key=session_key,
+                messages=messages,
+                request_kwargs=request_kwargs,
+                allowed=allowed,
+            )
+            if dep is not None:
+                return dep
 
         tol = self._depth_scaled_tolerance(self.effective_tolerance, messages)
         result = self._router.route(

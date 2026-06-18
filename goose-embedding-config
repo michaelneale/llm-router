@@ -1,0 +1,8 @@
+# Source this after starting the router with `just run-router`.
+export GOOSE_PROVIDER="router"
+export GOOSE_MODEL="embedding-routed"
+export GOOSE_CONTEXT_LIMIT="200000"
+
+unset GOOSE_FAST_MODEL
+unset LITELLM_HOST
+unset LITELLM_API_KEY

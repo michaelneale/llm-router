@@ -122,12 +122,12 @@ class TestGenerateLiteLLMConfig:
     def test_generates_model_list(self):
         config = generate_litellm_config(_pool_config())
         assert "model_list" in config
-        assert len(config["model_list"]) == 2
+        assert len(config["model_list"]) == 4
 
     def test_model_names_match_pool(self):
         config = generate_litellm_config(_pool_config())
         names = [e["model_name"] for e in config["model_list"]]
-        assert names == ["model-a", "model-b"]
+        assert names == ["nvidia-routed", "embedding-routed", "model-a", "model-b"]
 
     def test_litellm_model_preserved(self):
         config = generate_litellm_config(_pool_config())
@@ -145,18 +145,21 @@ class TestGenerateLiteLLMConfig:
         config = generate_litellm_config(_pool_config())
         assert "router_settings" in config
         assert config["router_settings"]["routing_strategy"] == "simple-shuffle"
+        assert "model_group_alias" not in config["router_settings"]
+        names = [e["model_name"] for e in config["model_list"]]
+        assert names[:2] == ["nvidia-routed", "embedding-routed"]
 
     def test_writes_to_file(self, tmp_path):
         out = tmp_path / "litellm.yaml"
         generate_litellm_config(_pool_config(), output=out)
         assert out.exists()
         loaded = yaml.safe_load(out.read_text())
-        assert len(loaded["model_list"]) == 2
+        assert len(loaded["model_list"]) == 4
 
     def test_from_yaml_path(self, tmp_path):
         pool_path = _write_pool_yaml(tmp_path)
         config = generate_litellm_config(pool_path)
-        assert len(config["model_list"]) == 2
+        assert len(config["model_list"]) == 4
 
 
 # ---------------------------------------------------------------------------
@@ -424,4 +427,4 @@ class TestCLIProxyConfig:
 
         assert out_path.exists()
         loaded = yaml.safe_load(out_path.read_text())
-        assert len(loaded["model_list"]) == 2
+        assert len(loaded["model_list"]) == 4

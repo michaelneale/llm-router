@@ -66,6 +66,77 @@ class FakeRouter(BaseRouter):
         )
 
 
+class FakeEmbeddingScorer:
+    def __init__(self, complexity: float):
+        self.complexity = complexity
+
+    def score_messages(self, messages):
+        return type(
+            "Score",
+            (),
+            {
+                "complexity": self.complexity,
+                "tool_calls_norm": 0.0,
+                "elapsed_ms": 1,
+                "rendered": ">>> user: test",
+            },
+        )()
+
+
+class FakeSessionHealthScorer:
+    def __init__(self, score: float, features: dict[str, float]):
+        self.score = score
+        self.features = features
+
+    def score_messages(self, messages, *, task: str = ""):
+        return type(
+            "HealthScore",
+            (),
+            {
+                "score": self.score,
+                "threshold": 0.0,
+                "should_escalate": False,
+                "features": self.features,
+                "window_text": task,
+            },
+        )()
+
+
+class TierRouter(BaseRouter):
+    """Router with one model per cost tier for embedding-ladder tests."""
+
+    def __init__(self, n: int = 5):
+        self._pool = [f"model-{i}" for i in range(n)]
+
+    def load(self, checkpoint_path):
+        pass
+
+    def route(self, question, *, tolerance=0.10, models=None):
+        return self.resolve(self._pool[0])
+
+    def has_model(self, model_name):
+        return model_name in self._pool
+
+    def resolve(self, model_name):
+        if model_name not in self._pool:
+            return None
+        costs = [
+            CostEstimate(
+                median_output_tokens=100,
+                cost_per_m_input_tokens=float(i + 1),
+                cost_per_m_output_tokens=float(i + 1),
+            )
+            for i, _ in enumerate(self._pool)
+        ]
+        return RoutingResult(
+            model_names=self._pool,
+            confidences=[1.0 if m == model_name else 0.0 for m in self._pool],
+            costs=costs,
+            selected_model=model_name,
+            metadata={"pinned": True},
+        )
+
+
 class TestModelRoutingStrategy:
     def test_sync_routing(self):
         strategy = ModelRoutingStrategy(FakeRouter("model-a"), tolerance=0.20)
@@ -228,6 +299,237 @@ models: []
         )
         assert dep["model_name"] == "model-a"
         assert strategy.last_result.metadata.get("test") is True
+
+    def test_embedding_routed_low_complexity_uses_cheapest_model(self):
+        """The embedding alias bypasses prefill and chooses from the cost ladder."""
+        strategy = ModelRoutingStrategy(FakeRouter("model-b"), tolerance=0.20)
+        strategy._embedding_scorer = FakeEmbeddingScorer(0.10)
+        strategy._litellm_router = type(
+            "R",
+            (),
+            {
+                "model_list": [
+                    {"model_name": "model-a", "litellm_params": {"model": "openai/a"}},
+                    {"model_name": "model-b", "litellm_params": {"model": "openai/b"}},
+                ]
+            },
+        )()
+
+        dep = strategy.get_available_deployment(
+            model="embedding-routed",
+            messages=[{"role": "user", "content": "Hello"}],
+        )
+
+        assert dep["model_name"] == "model-a"
+        assert strategy.last_result is not None
+        assert strategy.last_result.selected_model == "model-a"
+        assert strategy.last_result.metadata["router_mode"] == "embedding"
+        assert strategy.last_result.metadata["complexity"] == 0.1
+
+    def test_embedding_routed_high_complexity_uses_dearest_model(self):
+        """High complexity reaches the top of the cost ladder."""
+        strategy = ModelRoutingStrategy(FakeRouter("model-a"), tolerance=0.20)
+        strategy._embedding_scorer = FakeEmbeddingScorer(0.80)
+        strategy._litellm_router = type(
+            "R",
+            (),
+            {
+                "model_list": [
+                    {"model_name": "model-a", "litellm_params": {"model": "openai/a"}},
+                    {"model_name": "model-b", "litellm_params": {"model": "openai/b"}},
+                ]
+            },
+        )()
+
+        dep = strategy.get_available_deployment(
+            model="embedding-routed",
+            messages=[{"role": "user", "content": "Debug this flaky test"}],
+        )
+
+        assert dep["model_name"] == "model-b"
+        assert strategy.last_result is not None
+        assert strategy.last_result.selected_model == "model-b"
+        assert strategy.last_result.metadata["router_mode"] == "embedding"
+        assert strategy.last_result.metadata["complexity"] == 0.8
+
+    def test_embedding_routed_standard_complexity_uses_middle_ladder(self):
+        """The public complexity rubric maps standard work to the middle tier."""
+        strategy = ModelRoutingStrategy(TierRouter(5), tolerance=0.20)
+        strategy._embedding_scorer = FakeEmbeddingScorer(0.44)
+        strategy._litellm_router = type(
+            "R",
+            (),
+            {
+                "model_list": [
+                    {"model_name": f"model-{i}", "litellm_params": {"model": f"openai/{i}"}}
+                    for i in range(5)
+                ]
+            },
+        )()
+
+        dep = strategy.get_available_deployment(
+            model="embedding-routed",
+            messages=[{"role": "user", "content": "Fix this focused coding bug"}],
+        )
+
+        assert dep["model_name"] == "model-2"
+        assert strategy.last_result is not None
+        assert strategy.last_result.selected_model == "model-2"
+        assert strategy.last_result.metadata["ladder"] == [
+            "model-0",
+            "model-1",
+            "model-2",
+            "model-3",
+            "model-4",
+        ]
+
+    def test_embedding_routed_title_generation_stays_cheap(self):
+        """Goose title-generation bookkeeping should not spend the embedding scorer."""
+        strategy = ModelRoutingStrategy(FakeRouter("model-b"), tolerance=0.20)
+        strategy._embedding_scorer = FakeEmbeddingScorer(0.99)
+        strategy._litellm_router = type(
+            "R",
+            (),
+            {
+                "model_list": [
+                    {"model_name": "model-a", "litellm_params": {"model": "openai/a"}},
+                    {"model_name": "model-b", "litellm_params": {"model": "openai/b"}},
+                ]
+            },
+        )()
+
+        dep = strategy.get_available_deployment(
+            model="embedding-routed",
+            messages=[
+                {
+                    "role": "user",
+                    "content": (
+                        "---BEGIN USER MESSAGES---\n"
+                        "fix this bug\n"
+                        "---END USER MESSAGES---\n\n"
+                        "Generate a short title for the above messages."
+                    ),
+                }
+            ],
+        )
+
+        assert dep["model_name"] == "model-a"
+        assert strategy.last_result is not None
+        assert strategy.last_result.selected_model == "model-a"
+        assert strategy.last_result.metadata["pin_reason"] == "goose_title_generation"
+
+    def test_embedding_routed_hard_override_uses_escalation_model(self):
+        """The alternate scorer still shares the common hard-override policy."""
+        strategy = ModelRoutingStrategy(
+            FakeRouter("model-a"),
+            tolerance=0.20,
+            escalation_patterns=[r"(^|\s)!hard\b"],
+            escalation_model="model-b",
+        )
+        strategy._embedding_scorer = FakeEmbeddingScorer(0.10)
+        strategy._litellm_router = type(
+            "R",
+            (),
+            {
+                "model_list": [
+                    {"model_name": "model-a", "litellm_params": {"model": "openai/a"}},
+                    {"model_name": "model-b", "litellm_params": {"model": "openai/b"}},
+                ]
+            },
+        )()
+
+        dep = strategy.get_available_deployment(
+            model="embedding-routed",
+            messages=[{"role": "user", "content": "!hard fix this"}],
+        )
+
+        assert dep["model_name"] == "model-b"
+        assert strategy.last_result is not None
+        assert strategy.last_result.selected_model == "model-b"
+        assert strategy.last_result.metadata["escalated"] is True
+
+    def test_embedding_routed_ignores_shallow_session_health_spike(self):
+        """A first-turn health false positive should not override the ladder."""
+        strategy = ModelRoutingStrategy(
+            FakeRouter("model-b"),
+            tolerance=0.20,
+            escalation_model="model-b",
+        )
+        strategy._embedding_scorer = FakeEmbeddingScorer(0.10)
+        strategy._session_health_threshold = 0.88
+        strategy._session_health_scorer = FakeSessionHealthScorer(
+            0.96,
+            {
+                "event_count": 2.0,
+                "assistant_count": 0.0,
+                "tool_count": 0.0,
+                "error_count": 2.0,
+                "error_rate": 1.0,
+            },
+        )
+        strategy._litellm_router = type(
+            "R",
+            (),
+            {
+                "model_list": [
+                    {"model_name": "model-a", "litellm_params": {"model": "openai/a"}},
+                    {"model_name": "model-b", "litellm_params": {"model": "openai/b"}},
+                ]
+            },
+        )()
+
+        dep = strategy.get_available_deployment(
+            model="embedding-routed",
+            messages=[{"role": "user", "content": "Reply with exactly: ready"}],
+        )
+
+        assert dep["model_name"] == "model-a"
+        assert strategy.last_result is not None
+        assert strategy.last_result.selected_model == "model-a"
+        assert strategy.last_result.metadata["router_mode"] == "embedding"
+        assert strategy.last_result.metadata.get("escalated") is None
+
+    def test_embedding_routed_escalates_bad_session_health_with_history(self):
+        """A high health score with real trajectory evidence still forces top tier."""
+        strategy = ModelRoutingStrategy(
+            FakeRouter("model-a"),
+            tolerance=0.20,
+            escalation_model="model-b",
+        )
+        strategy._embedding_scorer = FakeEmbeddingScorer(0.10)
+        strategy._session_health_threshold = 0.88
+        strategy._session_health_scorer = FakeSessionHealthScorer(
+            0.96,
+            {
+                "event_count": 5.0,
+                "assistant_count": 2.0,
+                "tool_count": 2.0,
+                "command_count": 2.0,
+                "error_count": 2.0,
+                "repeated_error_recent": 1.0,
+            },
+        )
+        strategy._litellm_router = type(
+            "R",
+            (),
+            {
+                "model_list": [
+                    {"model_name": "model-a", "litellm_params": {"model": "openai/a"}},
+                    {"model_name": "model-b", "litellm_params": {"model": "openai/b"}},
+                ]
+            },
+        )()
+
+        dep = strategy.get_available_deployment(
+            model="embedding-routed",
+            messages=[{"role": "user", "content": "Fix this failing loop"}],
+        )
+
+        assert dep["model_name"] == "model-b"
+        assert strategy.last_result is not None
+        assert strategy.last_result.selected_model == "model-b"
+        assert strategy.last_result.metadata["escalated"] is True
+        assert "session_health" in strategy.last_result.metadata
 
     @pytest.mark.asyncio
     async def test_pin_model_async(self):
@@ -521,11 +823,7 @@ models: []
             messages=[
                 {
                     "role": "user",
-                    "content": (
-                        "<info-msg>\n"
-                        "Working directory: /tmp/repo\n"
-                        "</info-msg>"
-                    ),
+                    "content": ("<info-msg>\nWorking directory: /tmp/repo\n</info-msg>"),
                 }
             ],
             request_kwargs={"metadata": {"router_session_id": "s1"}},

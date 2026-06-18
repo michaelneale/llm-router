@@ -16,6 +16,8 @@ from model_router_toolkit.config import PoolConfig, load_config
 
 logger = logging.getLogger(__name__)
 
+ROUTED_ALIASES = ("nvidia-routed", "embedding-routed")
+
 
 def generate_litellm_config(
     pool_config: str | Path | PoolConfig,
@@ -48,14 +50,23 @@ def generate_litellm_config(
         }
         model_list.append(entry)
 
-    first_model_name = config.models[0].name if config.models else None
+    if model_list:
+        first_params = dict(model_list[0]["litellm_params"])
+        alias_entries = [
+            {
+                "model_name": alias,
+                # LiteLLM requires params for every exposed model group.
+                # The custom strategy intercepts these aliases and returns
+                # the real selected deployment before upstream dispatch.
+                "litellm_params": dict(first_params),
+            }
+            for alias in ROUTED_ALIASES
+        ]
+        model_list = alias_entries + model_list
+
     router_settings: dict[str, Any] = {
         "routing_strategy": "simple-shuffle",
     }
-    if first_model_name:
-        router_settings["model_group_alias"] = {
-            "nvidia-routed": first_model_name,
-        }
 
     litellm_config: dict[str, Any] = {
         "model_list": model_list,
@@ -88,7 +99,7 @@ def validate_model_alignment(
     litellm_names = set()
     for entry in litellm_raw.get("model_list", []):
         name = entry.get("model_name", "")
-        if name:
+        if name and name not in ROUTED_ALIASES:
             litellm_names.add(name)
 
     warnings: list[str] = []
