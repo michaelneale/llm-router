@@ -5,15 +5,15 @@ description: >
   benchmark traces using the actual real provider model pool. Use when someone
   asks to train from HF/public traces, relabel a new model pool, avoid confusing
   fixed-slot remapping, create correctness labels, sweep cost-vs-quality loss,
-  or produce a checkpoint/config for Goose. Local agent sessions are for
-  runtime spot checks, not the main training source.
+  or produce a checkpoint/config for an OpenAI-compatible client. Agent sessions
+  are for runtime spot checks, not the main training source.
 ---
 
 # Router From Public Traces
 
-Use this skill for the current router workflow in
-`~/Development/nvidia-router/llm-router`: train a cost router from public
-HF/benchmark task traces, using the **actual models we intend to serve**.
+Use this skill for the router workflow in this repository: train a cost router
+from public HF/benchmark task traces, using the **actual models intended for
+serving**.
 
 ## Non-Negotiable Rule
 
@@ -78,6 +78,11 @@ the same tier." For a new real model pool, run those real models and label them.
 
 3. Label the selected real models.
 
+   Do this in the environment that has access to the required provider APIs.
+   Hugging Face compute is useful after labels exist; it must not be assumed to
+   have provider access unless the required keys/network path are configured
+   there.
+
    For each prompt/task and each selected model:
 
    - call the actual provider model;
@@ -113,6 +118,11 @@ the same tier." For a new real model pool, run those real models and label them.
      --device mps
    ```
 
+   This step can run locally or be offloaded to Hugging Face Jobs after the
+   label CSV exists. Training/evaluation does not need provider API keys; it
+   only needs the config, labels, encoder download/cache, and HF token if it
+   will upload artifacts.
+
 6. Sweep cost/loss.
 
    Routing selects:
@@ -135,8 +145,36 @@ the same tier." For a new real model pool, run those real models and label them.
    ./scripts/restart-router.sh
    ```
 
-   Validate with public held-out metrics first, then with real Goose tasks as
+   Validate with public held-out metrics first, then with real client tasks as
    qualitative spot checks. The dashboard shows cost behavior, not quality.
+
+## Recommended Provider/HF Split
+
+If provider access is only available in one environment and Hugging Face is only
+being used for compute/artifact storage, split the retrain like this:
+
+| Phase | Where | Why |
+| --- | --- | --- |
+| Select public tasks | credentialed environment | cheap, reproducible, can inspect sample |
+| Call provider models | credentialed environment | uses required provider API access |
+| Judge/verify and write labels | credentialed environment | keeps raw outputs and retries resumable |
+| Upload labels/raw outputs | credentialed environment -> HF dataset/model repo | parks expensive work |
+| Split/train/evaluate/sweep | credentialed environment or HF Job | no provider keys required after labels exist |
+| Upload checkpoint/config/calibration | HF | makes `just run-router` style downloads possible |
+| Client spot checks | deployment/test environment | validates real client behavior |
+
+The desired scripts are:
+
+```text
+scripts/label_public_ladder.py       # provider calls, resumable labels
+scripts/hf_train_public_ladder.py    # no provider calls; train/eval/upload
+```
+
+Do not offload the labeling job to Hugging Face unless the required provider
+keys and network access are explicitly available there. Prefer uploading a
+completed `data/<pool>-labels.csv` plus raw-output JSONL shards, then running a
+GPU HF Job only for hidden-state extraction, torch training, tolerance sweep,
+and artifact upload.
 
 ## Time Expectations
 
@@ -165,6 +203,10 @@ Evaluation:      minutes
 If prefill features for exactly the same prompt set are already cached, retrain
 time drops sharply. If the model pool changes but the prompt set is identical,
 the expensive part is still relabeling the real models.
+
+With the provider/HF split, expect provider labeling to dominate wall-clock and
+cost. HF GPU time is usually small because it only handles the router encoder
+feature extraction, MLP training, evaluation, and upload.
 
 ## Current Repo Context
 
@@ -214,7 +256,7 @@ scripts/router_artifacts.py
 
 - Do not present legacy slot remapping as direct evidence about current real
   provider models.
-- Do not use local agent transcripts as the main checkpoint training source.
+- Keep checkpoint training grounded in public trace labels.
 - Do not optimize for savings alone; report loss on held-out labels.
 - Do not trust the dashboard as a quality signal.
 - Do not add keyword escalation as a substitute for direct labels unless it is
