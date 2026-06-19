@@ -46,6 +46,23 @@ DASHBOARD_HTML = """<!doctype html>
                border-radius:5px; transition:width .4s ease; }
   .row .pct { width:120px; text-align:right; color:var(--muted); font-size:12px;
               font-variant-numeric:tabular-nums; }
+  .routes { display:grid; gap:8px; }
+  .route { display:grid; grid-template-columns:84px 150px 1fr 90px; gap:10px;
+           align-items:center; padding:8px 10px; border:1px solid var(--line);
+           border-radius:8px; background:#0d1117; }
+  .route .time { color:var(--muted); font-size:11px; font-variant-numeric:tabular-nums; }
+  .route .decision { font-size:12px; color:var(--muted); white-space:nowrap;
+                     overflow:hidden; text-overflow:ellipsis; }
+  .route .chosen { min-width:0; font-size:13px; white-space:nowrap;
+                   overflow:hidden; text-overflow:ellipsis; }
+  .scorebox { display:grid; grid-template-columns:1fr 44px; gap:8px; align-items:center; }
+  .scorebar { height:10px; border-radius:999px; background:#21262d; overflow:hidden; }
+  .scorebar > div { height:100%; background:linear-gradient(90deg,var(--accent),var(--green));
+                    transition:width .4s ease; }
+  .scoreval { color:var(--muted); font-size:11px; text-align:right;
+              font-variant-numeric:tabular-nums; }
+  .route .snippet { grid-column:3 / 5; color:var(--muted); font-size:11px;
+                    white-space:nowrap; overflow:hidden; text-overflow:ellipsis; }
   .baseline { font-size:12px; color:var(--muted); }
   .knob-grid { display:grid; grid-template-columns:repeat(auto-fit,minmax(190px,1fr));
                gap:10px; margin-bottom:14px; }
@@ -63,6 +80,36 @@ DASHBOARD_HTML = """<!doctype html>
   .pill.warn { color:var(--warn); border-color:#8a6a1f; }
   .tolerance-panel { background:#0d1117; border:1px solid var(--line);
                      border-radius:8px; padding:12px; margin-bottom:14px; }
+  .turbo-panel { background:#b8b19f; color:#191714; border:2px solid #f3ecd8;
+                 border-right-color:#625d51; border-bottom-color:#625d51;
+                 border-radius:4px; padding:12px; margin-bottom:14px;
+                 box-shadow:inset 1px 1px 0 #fff7df, inset -1px -1px 0 #777063; }
+  .turbo-panel.on { background:#c8bda3; border-color:#fff4d5;
+                    border-right-color:#4f493f; border-bottom-color:#4f493f; }
+  .turbo-case { display:grid; grid-template-columns:112px 1fr auto; gap:12px;
+                align-items:center; }
+  .turbo-button { width:112px; min-height:58px; border-radius:3px; border:2px solid #fdf5dc;
+                  border-right-color:#4a4439; border-bottom-color:#4a4439;
+                  background:linear-gradient(#d8d0be,#8e8676); color:#111;
+                  font:800 20px/1 "Arial Black",Impact,sans-serif; letter-spacing:.05em;
+                  box-shadow:inset 2px 2px 0 #fff9e9, inset -2px -2px 0 #5f574b; }
+  .turbo-button:active, .turbo-button.on { border-color:#4a4439;
+                  border-right-color:#fff6df; border-bottom-color:#fff6df;
+                  background:linear-gradient(#807767,#d5ccb8);
+                  box-shadow:inset 2px 2px 0 #5f574b, inset -1px -1px 0 #fff8e2; }
+  .turbo-button small { display:block; font:700 10px/1.2 "Roboto Mono",monospace;
+                        letter-spacing:.08em; margin-top:5px; }
+  .turbo-face { min-width:0; }
+  .turbo-label { font:700 11px/1 "Roboto Mono",monospace; color:#454033;
+                 text-transform:uppercase; letter-spacing:.08em; margin-bottom:5px; }
+  .turbo-display { display:inline-block; min-width:86px; padding:5px 8px;
+                   background:#190d0a; border:2px inset #655b4c; color:#ff3b21;
+                   font:700 20px/1 "Roboto Mono",monospace;
+                   text-shadow:0 0 5px #ff3b21; letter-spacing:.06em; }
+  .turbo-status { color:#373227; font-size:12px; margin-top:5px; }
+  .turbo-led { width:16px; height:16px; border-radius:50%; background:#3a1610;
+               border:2px inset #5f574b; box-shadow:none; }
+  .turbo-panel.on .turbo-led { background:#ff2e1c; box-shadow:0 0 10px #ff2e1c; }
   .tol-head { display:flex; align-items:baseline; justify-content:space-between;
               gap:10px; margin-bottom:8px; }
   .tol-head strong { font-size:22px; font-weight:600; }
@@ -128,7 +175,7 @@ DASHBOARD_HTML = """<!doctype html>
       <div class="val accent" id="requests">—</div>
     </div>
     <div class="card">
-      <div class="label">Tokens (in / cached / out)</div>
+      <div class="label">Tokens (in / cache read / cache write / out)</div>
       <div class="val" id="tokens" style="font-size:20px">—</div>
     </div>
   </div>
@@ -141,6 +188,11 @@ DASHBOARD_HTML = """<!doctype html>
   <section>
     <h2>Routing distribution</h2>
     <div id="dist"><div class="empty">No requests yet.</div></div>
+  </section>
+
+  <section>
+    <h2>Recent routing decisions</h2>
+    <div id="routes"><div class="empty">No route log rows yet.</div></div>
   </section>
 
   <section>
@@ -213,6 +265,26 @@ async function setCachePinning(mode){
   }
 }
 
+async function setTurbo(enabled){
+  toleranceSaving = true;
+  $("status").textContent = enabled ? "engaging turbo..." : "disengaging turbo...";
+  try {
+    const r = await fetch("/router/tuning", {
+      method:"POST",
+      headers:{"Content-Type":"application/json"},
+      body:JSON.stringify({turbo:{enabled:!!enabled, duration_seconds:1800}})
+    });
+    if(!r.ok) throw new Error(await r.text());
+    const d = await r.json();
+    renderKnobs(d.routing_knobs || {});
+    $("status").textContent = "live";
+  } catch(e) {
+    $("status").textContent = "turbo update failed";
+  } finally {
+    toleranceSaving = false;
+  }
+}
+
 function renderKnobs(k){
   const box = $("knobs");
   if(!k || !Object.keys(k).length){
@@ -226,6 +298,7 @@ function renderKnobs(k){
 
   const sw = k.switching || {};
   const cache = k.cache_pinning || {};
+  const turbo = k.turbo || {};
   const top = k.top_tier || {};
   const override = k.manual_override || "none";
   const tolerance = Number(k.effective_tolerance || 0);
@@ -245,6 +318,16 @@ function renderKnobs(k){
     : (cacheMode === "dear_only"
       ? `pin if blend ≥ ${Number(cache.min_blend || 0).toFixed(2)}`
       : "pin every incumbent");
+  const turboActive = !!turbo.active;
+  const turboRemaining = Math.max(0, Number(turbo.remaining_seconds || 0));
+  const turboMinutes = Math.floor(turboRemaining / 60);
+  const turboSeconds = Math.floor(turboRemaining % 60);
+  const turboDisplay = turboActive
+    ? String(turboMinutes).padStart(2, "0") + ":" + String(turboSeconds).padStart(2, "0")
+    : "30:00";
+  const turboNote = turboActive
+    ? "forcing top tier until countdown expires"
+    : "press to force top tier for 30 minutes";
   const models = Array.isArray(k.models) ? k.models : [];
   const presets = Array.isArray(k.recommended_tolerances) ? k.recommended_tolerances : [];
   const presetButtons = presets.map(p => {
@@ -272,6 +355,20 @@ function renderKnobs(k){
     </tr>`).join("");
 
   box.innerHTML = `
+    <div class="turbo-panel ${turboActive ? "on" : ""}">
+      <div class="turbo-case">
+        <button id="turbo_button" class="turbo-button ${turboActive ? "on" : ""}" aria-pressed="${turboActive ? "true" : "false"}">
+          TURBO
+          <small>${turboActive ? "CANCEL" : "30 MIN"}</small>
+        </button>
+        <div class="turbo-face">
+          <div class="turbo-label">PC turbo override</div>
+          <div class="turbo-display">${esc(turboDisplay)}</div>
+          <div class="turbo-status">${esc(turboNote)}</div>
+        </div>
+        <div class="turbo-led" title="${turboActive ? "Turbo active" : "Turbo off"}"></div>
+      </div>
+    </div>
     <div class="tolerance-panel">
       <div class="tol-head">
         <div>
@@ -333,6 +430,7 @@ function renderKnobs(k){
     </div>
     <div class="pillrow">
       <span class="pill ${sw.effective ? "on" : "warn"}">switching ${esc(switchState)}</span>
+      <span class="pill ${turboActive ? "on" : ""}">turbo ${turboActive ? "on" : "off"}</span>
       <span class="pill ${cacheMode === "off" ? "warn" : "on"}">cache pin ${esc(cacheModeLabel)}</span>
       <span class="pill">pool ${esc((k.pool_config || "").split("/").pop() || "")}</span>
       <span class="pill">proxy ${esc((k.litellm_config || "").split("/").pop() || "")}</span>
@@ -344,6 +442,10 @@ function renderKnobs(k){
 
   const slider = $("tol_slider");
   const readout = $("tol_readout");
+  const turboButton = $("turbo_button");
+  if(turboButton){
+    turboButton.onclick = () => setTurbo(!turboActive);
+  }
   if(slider && readout){
     slider.oninput = () => { readout.textContent = Number(slider.value).toFixed(3); };
     slider.onchange = () => setTolerance(slider.value);
@@ -354,6 +456,42 @@ function renderKnobs(k){
   document.querySelectorAll("button.preset[data-cache-pin]").forEach(btn => {
     btn.onclick = () => setCachePinning(btn.dataset.cachePin);
   });
+}
+
+function renderRoutes(routes){
+  const box = $("routes");
+  if(!Array.isArray(routes) || !routes.length){
+    box.innerHTML = '<div class="empty">No route log rows yet.</div>';
+    return;
+  }
+  box.innerHTML = '<div class="routes">' + routes.slice(-18).reverse().map(r => {
+    const score = Number(r.score);
+    const hasScore = Number.isFinite(score);
+    const pct = hasScore ? Math.max(0, Math.min(100, score * 100)) : 0;
+    const time = r.ts ? new Date(r.ts * 1000).toLocaleTimeString([], {hour12:false}) : "—";
+    const kind = r.score_kind ? `${r.score_kind} ` : "";
+    const meta = r.metadata || {};
+    const reason = meta.pin_reason || meta.router_mode || "";
+    const decision = reason ? `${r.decision} · ${reason}` : r.decision;
+    const depth = Number.isFinite(Number(r.session_depth)) ? `d${r.session_depth}` : "";
+    const ctx = Number.isFinite(Number(r.context_tokens_est)) ? `ctx ${fmt(r.context_tokens_est)}` : "";
+    const rung = meta.rung_index != null && meta.rung_count != null
+      && Number.isFinite(Number(meta.rung_index)) && Number.isFinite(Number(meta.rung_count))
+      ? `rung ${meta.rung_index}/${meta.rung_count}`
+      : "";
+    const snippet = [kind + (hasScore ? score.toFixed(3) : "—"), rung, depth, ctx, r.task_view || ""]
+      .filter(Boolean).join(" · ");
+    return `<div class="route">
+      <div class="time">${esc(time)}</div>
+      <div class="decision" title="${esc(decision || "")}">${esc(decision || "route")}</div>
+      <div class="chosen" title="${esc(r.selected_model || "")}">${esc(r.selected_display || r.selected_model || "—")}</div>
+      <div class="scorebox">
+        <div class="scorebar"><div style="width:${pct}%"></div></div>
+        <div class="scoreval">${hasScore ? score.toFixed(3) : "—"}</div>
+      </div>
+      <div class="snippet" title="${esc(snippet)}">${esc(snippet)}</div>
+    </div>`;
+  }).join("") + '</div>';
 }
 
 async function load(){
@@ -367,10 +505,13 @@ async function load(){
     $("baseline").textContent = money(d.baseline_cost_usd || 0);
     $("requests").textContent = fmt(d.requests || 0);
     $("tokens").textContent = fmt(d.input_tokens||0) + " / " +
-      fmt(d.cached_input_tokens||0) + " / " + fmt(d.output_tokens||0);
+      fmt(d.cached_input_tokens||0) + " / " +
+      fmt(d.cache_creation_input_tokens||0) + " / " +
+      fmt(d.output_tokens||0);
     $("baseline_model").textContent = d.baseline_model || "—";
     $("uptime").textContent = Math.round(d.uptime_seconds||0) + "s";
     if(!toleranceSaving) renderKnobs(d.routing_knobs || {});
+    renderRoutes(d.recent_routes || []);
 
     const dist = d.routing_distribution || {};
     const names = Object.keys(dist);

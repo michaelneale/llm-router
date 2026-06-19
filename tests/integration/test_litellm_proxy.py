@@ -129,6 +129,24 @@ class TestGenerateLiteLLMConfig:
         names = [e["model_name"] for e in config["model_list"]]
         assert names == ["nvidia-routed", "embedding-routed", "model-a", "model-b"]
 
+    def test_anthropic_models_enable_prompt_cache(self):
+        pool = PoolConfig(
+            routing=RoutingConfig(method="prefill", tolerance=0.20),
+            models=[
+                ModelSpec(
+                    name="frontier",
+                    litellm_model="anthropic/claude-opus-4-8",
+                    cost_per_m_input_tokens=5.00,
+                    cost_per_m_output_tokens=25.00,
+                )
+            ],
+        )
+
+        config = generate_litellm_config(pool)
+        frontier = next(e for e in config["model_list"] if e["model_name"] == "frontier")
+
+        assert frontier["litellm_params"]["cache_control"] == {"type": "ephemeral"}
+
     def test_litellm_model_preserved(self):
         config = generate_litellm_config(_pool_config())
         models = {e["model_name"]: e["litellm_params"]["model"] for e in config["model_list"]}
@@ -240,6 +258,12 @@ class TestDashboardRoutingKnobs:
         assert all("slot" not in m for m in public_models)
         assert knobs["top_tier"]["provider_model"] == "openrouter/openai/test-b"
         assert "slot" not in knobs["top_tier"]
+        assert knobs["turbo"] == {
+            "active": False,
+            "remaining_seconds": 0,
+            "until_ts": 0.0,
+            "duration_seconds": 1800,
+        }
 
 
 # ---------------------------------------------------------------------------

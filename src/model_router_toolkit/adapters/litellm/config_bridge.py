@@ -43,6 +43,8 @@ def generate_litellm_config(
             params["api_key"] = f"os.environ/{env_var}"
         if m.api_base:
             params["api_base"] = m.api_base
+        if _uses_anthropic_prompt_cache(litellm_model):
+            params["cache_control"] = {"type": "ephemeral"}
 
         entry: dict[str, Any] = {
             "model_name": m.name,
@@ -144,3 +146,10 @@ def _api_key_env_var(litellm_model: str, api_base: str) -> str:
         api_base,
     )
     return "OPENAI_API_KEY"
+
+
+def _uses_anthropic_prompt_cache(litellm_model: str | None) -> bool:
+    """Ask Claude to apply automatic prompt caching via LiteLLM."""
+    if not litellm_model:
+        return False
+    return litellm_model.startswith("anthropic/")

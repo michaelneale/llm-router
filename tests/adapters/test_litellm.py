@@ -1,6 +1,10 @@
 import pytest
 
-from model_router_toolkit.adapters.litellm.strategy import ModelRoutingStrategy
+from model_router_toolkit.adapters.litellm.strategy import (
+    ModelRoutingStrategy,
+    inject_anthropic_cache_markers,
+)
+from model_router_toolkit.adapters.litellm.embedding import render_messages_for_embedding
 from model_router_toolkit.router import BaseRouter, CostEstimate, RoutingResult
 
 
@@ -102,6 +106,16 @@ class FakeSessionHealthScorer:
         )()
 
 
+def _count_cache_markers(obj):
+    if isinstance(obj, dict):
+        return (1 if "cache_control" in obj else 0) + sum(
+            _count_cache_markers(v) for v in obj.values()
+        )
+    if isinstance(obj, list):
+        return sum(_count_cache_markers(v) for v in obj)
+    return 0
+
+
 class TierRouter(BaseRouter):
     """Router with one model per cost tier for embedding-ladder tests."""
 
@@ -158,6 +172,49 @@ class TestModelRoutingStrategy:
         assert dep["model_name"] == "model-a"
         assert strategy.last_result is not None
         assert strategy.last_result.selected_model == "model-a"
+
+    def test_anthropic_selection_injects_prompt_cache_markers(self):
+        dep = {
+            "model_name": "model-b",
+            "litellm_params": {"model": "anthropic/claude-opus-4-8"},
+        }
+        messages = [
+            {"role": "user", "content": [{"type": "text", "text": "Fix this bug"}]},
+            {"role": "assistant", "content": [{"type": "text", "text": "I'll inspect it."}]},
+            {"role": "user", "content": [{"type": "tool_result", "content": "first result"}]},
+            {"role": "assistant", "content": [{"type": "text", "text": "I found a lead."}]},
+            {"role": "user", "content": [{"type": "tool_result", "content": "second result"}]},
+            {"role": "assistant", "content": [{"type": "text", "text": "I'll patch it."}]},
+            {"role": "user", "content": [{"type": "tool_result", "content": "test output"}]},
+        ]
+        request_kwargs = {
+            "system": [{"type": "text", "text": "You are goose."}],
+            "tools": [
+                {"name": "shell", "description": "run commands", "input_schema": {"type": "object"}}
+            ],
+        }
+
+        added = inject_anthropic_cache_markers(dep, messages, request_kwargs)
+
+        assert added == 4
+        assert request_kwargs["system"][0]["cache_control"] == {"type": "ephemeral"}
+        assert request_kwargs["tools"][0]["cache_control"] == {"type": "ephemeral"}
+        assert messages[2]["content"][0]["cache_control"] == {"type": "ephemeral"}
+        assert messages[-1]["content"][0]["cache_control"] == {"type": "ephemeral"}
+        assert _count_cache_markers({"messages": messages, **request_kwargs}) == 4
+
+    def test_openai_selection_does_not_inject_prompt_cache_markers(self):
+        dep = {"model_name": "model-a", "litellm_params": {"model": "openai/a"}}
+        messages = [{"role": "user", "content": "hello"}]
+        request_kwargs = {
+            "system": "You are goose.",
+            "tools": [{"name": "shell", "description": "run commands"}],
+        }
+
+        added = inject_anthropic_cache_markers(dep, messages, request_kwargs)
+
+        assert added == 0
+        assert _count_cache_markers({"messages": messages, **request_kwargs}) == 0
 
     def test_tolerance_bounds(self):
         strategy = ModelRoutingStrategy(FakeRouter(), tolerance=0.10)
@@ -383,6 +440,105 @@ models: []
             "model-4",
         ]
 
+    def test_embedding_render_anchors_last_real_user_not_goose_info(self):
+        rendered = render_messages_for_embedding(
+            [
+                {"role": "user", "content": "Fix the failing CLI test"},
+                {"role": "assistant", "content": "I will inspect the failure."},
+                {"role": "tool", "content": "pytest failed with exit code: 1"},
+                {
+                    "role": "user",
+                    "content": "<info-msg>\nWorking directory: /tmp/repo\n</info-msg>",
+                },
+            ]
+        )
+
+        assert ">>> user: Fix the failing CLI test" in rendered
+        assert "Working directory" not in rendered
+        assert "tool: pytest failed with exit code: 1" in rendered
+        assert rendered.count(">>>") == 1
+
+    def test_embedding_render_drops_stale_history_before_latest_user(self):
+        rendered = render_messages_for_embedding(
+            [
+                {"role": "user", "content": "Fix the CORS issue"},
+                {
+                    "role": "assistant",
+                    "content": "Old CORS reasoning " * 80,
+                },
+                {
+                    "role": "user",
+                    "content": "ok open the draft PR and monitor CI",
+                },
+                {"role": "tool", "content": "created draft PR https://example.test/pr/1"},
+                {
+                    "role": "tool",
+                    "content": "Lint Rust Code pending\nBuild and Test pending",
+                },
+                {
+                    "role": "user",
+                    "content": "<info-msg>\nWorking directory: /tmp/repo\n</info-msg>",
+                },
+            ]
+        )
+
+        assert rendered.startswith(">>> user: ok open the draft PR and monitor CI")
+        assert "Old CORS reasoning" not in rendered
+        assert "Working directory" not in rendered
+        assert "tool: Lint Rust Code pending" in rendered
+
+    def test_embedding_render_budget_keeps_newest_state(self):
+        messages = [{"role": "user", "content": "Fix the failing build"}]
+        messages.extend(
+            {
+                "role": "tool",
+                "content": f"old compile warning {i}\n" + ("noise " * 120),
+            }
+            for i in range(12)
+        )
+        messages.append(
+            {
+                "role": "tool",
+                "content": "LATEST cargo test passed\nfinished target/debug/deps/acp_cors_test",
+            }
+        )
+
+        rendered = render_messages_for_embedding(messages)
+
+        assert len(rendered) <= 1400
+        assert "LATEST cargo test passed" in rendered
+        assert "old compile warning 0" not in rendered
+
+    def test_embedding_routed_info_only_followup_still_scores_embedding(self):
+        strategy = ModelRoutingStrategy(FakeRouter("model-b"), tolerance=0.20)
+        strategy._embedding_scorer = FakeEmbeddingScorer(0.80)
+        strategy._litellm_router = type(
+            "R",
+            (),
+            {
+                "model_list": [
+                    {"model_name": "model-a", "litellm_params": {"model": "openai/a"}},
+                    {"model_name": "model-b", "litellm_params": {"model": "openai/b"}},
+                ]
+            },
+        )()
+
+        dep = strategy.get_available_deployment(
+            model="embedding-routed",
+            messages=[
+                {"role": "user", "content": "Fix the failing CLI test"},
+                {"role": "assistant", "content": "The first attempt failed."},
+                {
+                    "role": "user",
+                    "content": "<info-msg>\nWorking directory: /tmp/repo\n</info-msg>",
+                },
+            ],
+        )
+
+        assert dep["model_name"] == "model-b"
+        assert strategy.last_result.metadata["router_mode"] == "embedding"
+        assert strategy.last_result.metadata.get("utility") is None
+
     def test_embedding_routed_title_generation_stays_cheap(self):
         """Goose title-generation bookkeeping should not spend the embedding scorer."""
         strategy = ModelRoutingStrategy(FakeRouter("model-b"), tolerance=0.20)
@@ -530,6 +686,158 @@ models: []
         assert strategy.last_result.selected_model == "model-b"
         assert strategy.last_result.metadata["escalated"] is True
         assert "session_health" in strategy.last_result.metadata
+
+    def test_embedding_routed_info_only_does_not_trip_session_health(self):
+        """Goose bookkeeping continuations should not repeatedly force top tier."""
+        strategy = ModelRoutingStrategy(
+            FakeRouter("model-b"),
+            tolerance=0.20,
+            escalation_model="model-b",
+        )
+        strategy._embedding_scorer = FakeEmbeddingScorer(0.10)
+        strategy._session_health_threshold = 0.88
+        strategy._session_health_scorer = FakeSessionHealthScorer(
+            0.99,
+            {
+                "event_count": 12.0,
+                "assistant_count": 5.0,
+                "tool_count": 5.0,
+                "command_count": 5.0,
+                "error_count": 12.0,
+                "repeated_error_recent": 4.0,
+            },
+        )
+        strategy._litellm_router = type(
+            "R",
+            (),
+            {
+                "model_list": [
+                    {"model_name": "model-a", "litellm_params": {"model": "openai/a"}},
+                    {"model_name": "model-b", "litellm_params": {"model": "openai/b"}},
+                ]
+            },
+        )()
+
+        dep = strategy.get_available_deployment(
+            model="embedding-routed",
+            messages=[
+                {"role": "user", "content": "Fix this failing loop"},
+                {"role": "assistant", "content": "The test command failed with exit code: 1"},
+                {
+                    "role": "user",
+                    "content": "<info-msg>\nWorking directory: /tmp/repo\n</info-msg>",
+                },
+            ],
+        )
+
+        assert dep["model_name"] == "model-a"
+        assert strategy.last_result is not None
+        assert strategy.last_result.selected_model == "model-a"
+        assert strategy.last_result.metadata["router_mode"] == "embedding"
+        assert strategy.last_result.metadata.get("session_health") is None
+        assert strategy.last_result.metadata.get("escalated") is None
+
+    def test_turbo_forces_top_model(self):
+        """Dashboard turbo mode forces the configured top model."""
+        strategy = ModelRoutingStrategy(
+            FakeRouter("model-a"),
+            tolerance=0.20,
+            escalation_model="model-b",
+        )
+        strategy._litellm_router = type(
+            "R",
+            (),
+            {
+                "model_list": [
+                    {"model_name": "model-a", "litellm_params": {"model": "openai/a"}},
+                    {"model_name": "model-b", "litellm_params": {"model": "openai/b"}},
+                ]
+            },
+        )()
+
+        state = strategy.set_turbo(enabled=True, duration_seconds=1800)
+        dep = strategy.get_available_deployment(
+            model="nvidia-routed",
+            messages=[{"role": "user", "content": "hello"}],
+        )
+
+        assert state["active"] is True
+        assert 0 < state["remaining_seconds"] <= 1800
+        assert dep["model_name"] == "model-b"
+        assert strategy.last_result is not None
+        assert strategy.last_result.selected_model == "model-b"
+        assert strategy.last_result.metadata["escalated"] is True
+        assert strategy.last_result.metadata["turbo"]["active"] is True
+
+    def test_turbo_overrides_title_generation_cheap_path(self):
+        """When turbo is on, even bookkeeping requests use the top tier."""
+        strategy = ModelRoutingStrategy(
+            FakeRouter("model-a"),
+            tolerance=0.20,
+            escalation_model="model-b",
+        )
+        strategy._litellm_router = type(
+            "R",
+            (),
+            {
+                "model_list": [
+                    {"model_name": "model-a", "litellm_params": {"model": "openai/a"}},
+                    {"model_name": "model-b", "litellm_params": {"model": "openai/b"}},
+                ]
+            },
+        )()
+        strategy.set_turbo(enabled=True, duration_seconds=1800)
+
+        dep = strategy.get_available_deployment(
+            model="embedding-routed",
+            messages=[
+                {
+                    "role": "user",
+                    "content": (
+                        "---BEGIN USER MESSAGES---\n"
+                        "fix this bug\n"
+                        "---END USER MESSAGES---\n\n"
+                        "Generate a short title for the above messages."
+                    ),
+                }
+            ],
+        )
+
+        assert dep["model_name"] == "model-b"
+        assert strategy.last_result is not None
+        assert strategy.last_result.selected_model == "model-b"
+        assert strategy.last_result.metadata["turbo"]["active"] is True
+
+    def test_turbo_expires(self):
+        """Expired turbo mode falls back to normal routing."""
+        strategy = ModelRoutingStrategy(
+            FakeRouter("model-a"),
+            tolerance=0.20,
+            escalation_model="model-b",
+        )
+        strategy._litellm_router = type(
+            "R",
+            (),
+            {
+                "model_list": [
+                    {"model_name": "model-a", "litellm_params": {"model": "openai/a"}},
+                    {"model_name": "model-b", "litellm_params": {"model": "openai/b"}},
+                ]
+            },
+        )()
+        strategy.set_turbo(enabled=True, duration_seconds=1)
+        strategy._turbo_until = 1.0
+
+        state = strategy.turbo_state()
+        dep = strategy.get_available_deployment(
+            model="nvidia-routed",
+            messages=[{"role": "user", "content": "hello"}],
+        )
+
+        assert state["active"] is False
+        assert dep["model_name"] == "model-a"
+        assert strategy.last_result is not None
+        assert "turbo" not in strategy.last_result.metadata
 
     @pytest.mark.asyncio
     async def test_pin_model_async(self):

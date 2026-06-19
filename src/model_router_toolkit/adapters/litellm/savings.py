@@ -28,6 +28,7 @@ class _Totals:
     requests: int = 0
     input_tokens: int = 0
     cached_input_tokens: int = 0
+    cache_creation_input_tokens: int = 0
     output_tokens: int = 0
     actual_cost: float = 0.0
     baseline_cost: float = 0.0
@@ -40,6 +41,7 @@ class Usage:
     input_tokens: int
     output_tokens: int
     cached_input_tokens: int = 0
+    cache_creation_input_tokens: int = 0
 
 
 class SavingsTracker:
@@ -55,6 +57,9 @@ class SavingsTracker:
         self._log_path = log_path or os.environ.get("ROUTER_SAVINGS_LOG")
         self._cache_read_multiplier = float(
             os.environ.get("ROUTER_CACHE_READ_MULTIPLIER", "0.10")
+        )
+        self._cache_write_multiplier = float(
+            os.environ.get("ROUTER_CACHE_WRITE_MULTIPLIER", "1.25")
         )
         # rate cache: model_name -> (in_per_m, out_per_m), filled from RoutingResult
         self._rates: dict[str, tuple[float, float]] = {}
@@ -107,13 +112,22 @@ class SavingsTracker:
         *,
         input_tokens: int,
         cached_input_tokens: int,
+        cache_creation_input_tokens: int,
         output_tokens: int,
         input_rate: float,
         output_rate: float,
     ) -> float:
         cached = max(0, min(cached_input_tokens, input_tokens))
-        uncached = max(0, input_tokens - cached)
-        effective_input_tokens = uncached + cached * self._cache_read_multiplier
+        cache_write = max(
+            0,
+            min(cache_creation_input_tokens, max(0, input_tokens - cached)),
+        )
+        uncached = max(0, input_tokens - cached - cache_write)
+        effective_input_tokens = (
+            uncached
+            + cached * self._cache_read_multiplier
+            + cache_write * self._cache_write_multiplier
+        )
         return effective_input_tokens / 1e6 * input_rate + output_tokens / 1e6 * output_rate
 
     def record(
@@ -123,18 +137,21 @@ class SavingsTracker:
         out_tokens: int | None = None,
         *,
         cached_input_tokens: int = 0,
+        cache_creation_input_tokens: int = 0,
     ) -> None:
         """Record one completed request.
 
         result: the RoutingResult for this request (has selected_model + rates)
         in_tokens / out_tokens: real usage from the response.
         cached_input_tokens: provider-reported prompt-cache read tokens, if any.
+        cache_creation_input_tokens: provider-reported prompt-cache write tokens, if any.
         """
         if isinstance(in_tokens, Usage):
             usage = in_tokens
             in_tokens = usage.input_tokens
             out_tokens = usage.output_tokens
             cached_input_tokens = usage.cached_input_tokens
+            cache_creation_input_tokens = usage.cache_creation_input_tokens
         elif out_tokens is None:
             raise TypeError("out_tokens is required when in_tokens is not a Usage")
 
@@ -142,9 +159,14 @@ class SavingsTracker:
             self._ingest_rates(result)
             selected = result.selected_model
             sel_in, sel_out = self._rates.get(selected, (0.0, 0.0))
+            cached_clamped = max(0, min(cached_input_tokens, in_tokens))
+            cache_creation_clamped = max(
+                0, min(cache_creation_input_tokens, max(0, in_tokens - cached_clamped))
+            )
             actual = self._cost(
                 input_tokens=in_tokens,
-                cached_input_tokens=cached_input_tokens,
+                cached_input_tokens=cached_clamped,
+                cache_creation_input_tokens=cache_creation_clamped,
                 output_tokens=out_tokens,
                 input_rate=sel_in,
                 output_rate=sel_out,
@@ -155,7 +177,8 @@ class SavingsTracker:
             )
             baseline = self._cost(
                 input_tokens=in_tokens,
-                cached_input_tokens=cached_input_tokens,
+                cached_input_tokens=cached_clamped,
+                cache_creation_input_tokens=cache_creation_clamped,
                 output_tokens=out_tokens,
                 input_rate=base_in,
                 output_rate=base_out,
@@ -163,7 +186,8 @@ class SavingsTracker:
 
             self._t.requests += 1
             self._t.input_tokens += in_tokens
-            self._t.cached_input_tokens += max(0, min(cached_input_tokens, in_tokens))
+            self._t.cached_input_tokens += cached_clamped
+            self._t.cache_creation_input_tokens += cache_creation_clamped
             self._t.output_tokens += out_tokens
             self._t.actual_cost += actual
             self._t.baseline_cost += baseline
@@ -180,7 +204,8 @@ class SavingsTracker:
                                     "selected": selected,
                                     "baseline": self._baseline_name,
                                     "in_tokens": in_tokens,
-                                    "cached_input_tokens": cached_input_tokens,
+                                    "cached_input_tokens": cached_clamped,
+                                    "cache_creation_input_tokens": cache_creation_clamped,
                                     "out_tokens": out_tokens,
                                     "actual_cost": round(actual, 8),
                                     "baseline_cost": round(baseline, 8),
@@ -223,8 +248,10 @@ class SavingsTracker:
                 "requests": t.requests,
                 "input_tokens": t.input_tokens,
                 "cached_input_tokens": t.cached_input_tokens,
+                "cache_creation_input_tokens": t.cache_creation_input_tokens,
                 "output_tokens": t.output_tokens,
                 "cache_read_multiplier": self._cache_read_multiplier,
+                "cache_write_multiplier": self._cache_write_multiplier,
                 "actual_cost_usd": round(t.actual_cost, 6),
                 "baseline_cost_usd": round(t.baseline_cost, 6),
                 "saved_usd": round(saved, 6),
@@ -264,6 +291,8 @@ def _cached_tokens_from_usage(usage: dict) -> int:
     cached = _int(usage.get("cached_tokens"))
     cached += _int(usage.get("cache_read_tokens"))
     cached += _int(usage.get("cache_read_input_tokens"))
+    if cached:
+        return cached
 
     for key in ("prompt_tokens_details", "input_tokens_details"):
         details = usage.get(key)
@@ -273,6 +302,26 @@ def _cached_tokens_from_usage(usage: dict) -> int:
             cached += _int(details.get("cache_read_input_tokens"))
 
     return cached
+
+
+def _cache_creation_tokens_from_usage(usage: dict) -> int:
+    """Best-effort extraction of provider/LiteLLM prompt-cache write tokens."""
+    created = _int(usage.get("cache_creation_input_tokens"))
+    created += _int(usage.get("cache_write_input_tokens"))
+    created += _int(usage.get("cache_creation_tokens"))
+    created += _int(usage.get("cache_write_tokens"))
+    if created:
+        return created
+
+    for key in ("prompt_tokens_details", "input_tokens_details"):
+        details = usage.get(key)
+        if isinstance(details, dict):
+            created += _int(details.get("cache_creation_input_tokens"))
+            created += _int(details.get("cache_write_input_tokens"))
+            created += _int(details.get("cache_creation_tokens"))
+            created += _int(details.get("cache_write_tokens"))
+
+    return created
 
 
 def _usage_from_obj(data) -> Usage | None:
@@ -293,10 +342,14 @@ def _usage_from_obj(data) -> Usage | None:
     prompt_tokens = _int(pt)
     completion_tokens = _int(ct)
     cached_tokens = max(0, min(_cached_tokens_from_usage(usage), prompt_tokens))
+    cache_creation_tokens = max(
+        0, min(_cache_creation_tokens_from_usage(usage), prompt_tokens)
+    )
     return Usage(
         input_tokens=prompt_tokens,
         output_tokens=completion_tokens,
         cached_input_tokens=cached_tokens,
+        cache_creation_input_tokens=cache_creation_tokens,
     )
 
 

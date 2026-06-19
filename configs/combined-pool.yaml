@@ -10,14 +10,13 @@
 # `display_name` / `litellm_model` are the current provider models we serve in
 # that slot. This aggressive pool uses Claude Opus 4.8 as the frontier/top
 # escalation slot, caps the high automatic slot at GPT-5.4 Mini, and uses GPT
-# mini/nano variants plus a GPT-5.4 Mini cap before Sonnet. The current trial
-# tolerance is 0.145: a high-savings local replay point with about 3.9pp public
-# verified-label loss. Use ROUTER_TOLERANCE or scripts/select_router_operating_point.py
-# for sweeps.
+# mini/nano variants plus a GPT-5.4 Mini cap before Sonnet. Default tolerance
+# is the quality point (0.04); use the dashboard or ROUTER_TOLERANCE for
+# higher-savings experiments.
 routing:
   method: prefill
   checkpoint: checkpoints/prefill_router_combined.pt
-  tolerance: 0.145
+  tolerance: 0.04
   output_token_weight: 0.25
   encoder: Qwen/Qwen3.5-0.8B
   encoder_backend: transformers

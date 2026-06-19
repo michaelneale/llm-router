@@ -84,8 +84,8 @@ Expected sanity checks:
 </p>
 
 *The `/dashboard` endpoint shows the live provider model ladder, routing
-distribution, tolerance controls, cache mode, session-health escalations, and
-cost saved vs. a frontier baseline.*
+distribution, tolerance controls, cache mode, a timed turbo top-tier override,
+session-health escalations, and cost saved vs. a frontier baseline.*
 
 ## The Basic Idea
 
@@ -293,8 +293,7 @@ floor.
 | `GET  /dashboard` | live savings and routing controls |
 | `GET  /savings` | same data as JSON |
 | `POST /savings/reset` | reset live counters |
-| `POST /routing/tolerance` | change tolerance without restarting |
-| `POST /routing/cache-pinning` | change cache pinning without restarting |
+| `POST /router/tuning` | change tolerance, cache pinning, or turbo mode without restarting |
 
 ## What This Fork Added
 
@@ -302,8 +301,8 @@ floor.
   combined full-spectrum router.
 - Learned session-health escalation from public agent trajectories.
 - Hugging Face artifact packaging and downloader (`just run-router`).
-- Live dashboard for real provider models, savings, tolerance, cache mode, and
-  session-health escalations.
+- Live dashboard for real provider models, savings, tolerance, cache mode, turbo
+  mode, and session-health escalations.
 - Streaming usage capture, cache-aware switching, explicit `!hard` top-tier
   override, and configurable GPU routing (`ROUTER_DEVICE=mps`, CUDA, or CPU).
 

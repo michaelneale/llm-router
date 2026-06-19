@@ -104,8 +104,57 @@ def test_extract_usage_from_sse_keeps_final_cached_usage():
     )
 
 
+def test_extract_usage_includes_anthropic_cache_creation_tokens():
+    usage = extract_usage(
+        b"""
+        {
+          "usage": {
+            "input_tokens": 1000,
+            "output_tokens": 200,
+            "cache_creation_input_tokens": 700,
+            "cache_read_input_tokens": 100
+          }
+        }
+        """
+    )
+
+    assert usage == Usage(
+        input_tokens=1000,
+        output_tokens=200,
+        cached_input_tokens=100,
+        cache_creation_input_tokens=700,
+    )
+
+
+def test_extract_usage_does_not_double_count_litellm_cache_details():
+    usage = extract_usage(
+        b"""
+        {
+          "usage": {
+            "input_tokens": 1000,
+            "output_tokens": 200,
+            "prompt_tokens_details": {
+              "cached_tokens": 100,
+              "cache_creation_tokens": 700
+            },
+            "cache_creation_input_tokens": 700,
+            "cache_read_input_tokens": 100
+          }
+        }
+        """
+    )
+
+    assert usage == Usage(
+        input_tokens=1000,
+        output_tokens=200,
+        cached_input_tokens=100,
+        cache_creation_input_tokens=700,
+    )
+
+
 def test_record_prices_cached_input_tokens_with_multiplier(monkeypatch):
     monkeypatch.setenv("ROUTER_CACHE_READ_MULTIPLIER", "0.10")
+    monkeypatch.setenv("ROUTER_CACHE_WRITE_MULTIPLIER", "1.25")
     tracker = SavingsTracker(baseline_model="frontier")
     tracker.set_display_names({"cheap": "openai/cheap", "frontier": "anthropic/frontier"})
 
@@ -116,6 +165,31 @@ def test_record_prices_cached_input_tokens_with_multiplier(monkeypatch):
     assert snapshot["requests"] == 1
     assert snapshot["input_tokens"] == 1000
     assert snapshot["cached_input_tokens"] == 600
+    assert snapshot["cache_creation_input_tokens"] == 0
     assert snapshot["output_tokens"] == 100
     assert snapshot["actual_cost_usd"] == 0.00146
     assert snapshot["baseline_cost_usd"] == 0.0048
+
+
+def test_record_prices_cache_creation_tokens_with_multiplier(monkeypatch):
+    monkeypatch.setenv("ROUTER_CACHE_READ_MULTIPLIER", "0.10")
+    monkeypatch.setenv("ROUTER_CACHE_WRITE_MULTIPLIER", "1.25")
+    tracker = SavingsTracker(baseline_model="frontier")
+    tracker.set_display_names({"cheap": "openai/cheap", "frontier": "anthropic/frontier"})
+
+    tracker.record(
+        _result(),
+        Usage(
+            input_tokens=1000,
+            output_tokens=100,
+            cached_input_tokens=200,
+            cache_creation_input_tokens=600,
+        ),
+    )
+
+    snapshot = tracker.snapshot()
+
+    assert snapshot["cached_input_tokens"] == 200
+    assert snapshot["cache_creation_input_tokens"] == 600
+    assert snapshot["actual_cost_usd"] == 0.00197
+    assert snapshot["baseline_cost_usd"] == 0.00685

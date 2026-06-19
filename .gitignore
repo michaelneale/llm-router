@@ -40,6 +40,8 @@ skills/
 !.agents/skills/
 !.agents/skills/router-from-traces/
 !.agents/skills/router-from-traces/SKILL.md
+!.agents/skills/router-with-agents/
+!.agents/skills/router-with-agents/SKILL.md
 working/
 
 # ---------------------------------------------------------------------------

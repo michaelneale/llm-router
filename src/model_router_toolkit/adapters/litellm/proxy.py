@@ -205,6 +205,12 @@ def _build_routing_knobs(
             "min_blend": cache_pin_min_blend,
             "recommended_modes": _cache_pin_modes(),
         },
+        "turbo": {
+            "active": False,
+            "remaining_seconds": 0,
+            "until_ts": 0.0,
+            "duration_seconds": 1800,
+        },
         "top_tier": by_slot.get(top_slot),
         "manual_override": "!hard" if any("!hard" in p for p in patterns) else "",
         "session_health": {
@@ -556,6 +562,76 @@ def start_proxy(
 
     from model_router_toolkit.adapters.litellm.dashboard import DASHBOARD_HTML
 
+    recent_routes_started_at = time.time()
+
+    def _recent_routes(limit: int = 40) -> list[dict[str, Any]]:
+        path = os.environ.get("ROUTER_ROUTE_LOG", "")
+        if not path:
+            return []
+        try:
+            from collections import deque
+
+            rows: list[dict[str, Any]] = []
+            with open(path, errors="replace") as f:
+                lines = deque(f, maxlen=max(1, limit * 4))
+            for line in lines:
+                try:
+                    row = _json.loads(line)
+                except (TypeError, ValueError):
+                    continue
+                if not isinstance(row, dict):
+                    continue
+                try:
+                    if float(row.get("ts") or 0.0) < recent_routes_started_at:
+                        continue
+                except (TypeError, ValueError):
+                    continue
+                selected = str(row.get("selected_model") or "")
+                metadata = row.get("metadata") if isinstance(row.get("metadata"), dict) else {}
+                confidences = row.get("confidences") if isinstance(row.get("confidences"), dict) else {}
+                score = metadata.get("complexity")
+                score_kind = "complexity" if score is not None else ""
+                if (
+                    score is None
+                    and row.get("decision") == "route"
+                    and selected
+                    and selected in confidences
+                ):
+                    score = confidences.get(selected)
+                    score_kind = "confidence"
+                if score is None:
+                    score = row.get("session_health_score")
+                    score_kind = "health" if score is not None else ""
+                public_metadata = {}
+                for key, value in (
+                    ("pin_reason", metadata.get("pin_reason")),
+                    ("router_mode", metadata.get("router_mode") or row.get("router_mode")),
+                    ("complexity", metadata.get("complexity")),
+                    ("tool_calls_norm", metadata.get("tool_calls_norm")),
+                    ("rung_index", metadata.get("rung_index")),
+                    ("rung_count", metadata.get("rung_count")),
+                    ("raw_selected_model", row.get("raw_selected_model")),
+                ):
+                    if value is not None:
+                        public_metadata[key] = value
+                rows.append(
+                    {
+                        "ts": row.get("ts"),
+                        "decision": row.get("decision") or "",
+                        "selected_model": selected,
+                        "selected_display": model_display_names.get(selected, selected),
+                        "score": score,
+                        "score_kind": score_kind,
+                        "session_depth": row.get("session_depth"),
+                        "context_tokens_est": row.get("context_tokens_est"),
+                        "task_view": row.get("task_view") or "",
+                        "metadata": public_metadata,
+                    }
+                )
+            return rows[-limit:]
+        except OSError:
+            return []
+
     def _current_routing_knobs() -> dict[str, Any]:
         knobs = dict(routing_knobs)
         strategy = _strategy_ref
@@ -574,12 +650,16 @@ def start_proxy(
         )
         cache_pinning.setdefault("recommended_modes", _cache_pin_modes())
         knobs["cache_pinning"] = cache_pinning
+        turbo_state = getattr(strategy, "turbo_state", None)
+        if callable(turbo_state):
+            knobs["turbo"] = turbo_state()
         return knobs
 
     @litellm_app.get("/savings")
     async def _savings():  # noqa: ANN202
         snapshot = tracker.snapshot()
         snapshot["routing_knobs"] = _current_routing_knobs()
+        snapshot["recent_routes"] = _recent_routes()
         return JSONResponse(snapshot)
 
     @litellm_app.post("/savings/reset")
@@ -642,6 +722,30 @@ def start_proxy(
                     status_code=400,
                 )
 
+        turbo = body.get("turbo")
+        if turbo is not None:
+            if not isinstance(turbo, dict):
+                return JSONResponse({"error": "turbo must be an object"}, status_code=400)
+            enabled_value = turbo.get("enabled", False)
+            if isinstance(enabled_value, str):
+                enabled = enabled_value.lower() in {"1", "true", "yes", "on"}
+            else:
+                enabled = bool(enabled_value)
+            try:
+                duration = float(turbo.get("duration_seconds", 1800))
+            except (TypeError, ValueError):
+                return JSONResponse(
+                    {"error": "turbo duration_seconds must be a number"},
+                    status_code=400,
+                )
+            set_turbo = getattr(strategy, "set_turbo", None)
+            if not callable(set_turbo):
+                return JSONResponse(
+                    {"error": "routing strategy does not support turbo"},
+                    status_code=400,
+                )
+            set_turbo(enabled=enabled, duration_seconds=duration)
+
         return JSONResponse({"routing_knobs": _current_routing_knobs()})
 
     @litellm_app.post("/router/route")
@@ -701,11 +805,21 @@ def start_proxy(
             "routing": None,
         }
         if result is not None:
-            response["routing"] = {
+            metadata = result.metadata or {}
+            routing = {
                 "selected_model": result.selected_model,
-                "confidences": dict(zip(result.model_names, result.confidences)),
-                "metadata": result.metadata,
+                "metadata": metadata,
             }
+            if metadata.get("router_mode") == "embedding":
+                routing["score"] = {
+                    "kind": "complexity",
+                    "value": metadata.get("complexity"),
+                    "rung_index": metadata.get("rung_index"),
+                    "rung_count": metadata.get("rung_count"),
+                }
+            else:
+                routing["confidences"] = dict(zip(result.model_names, result.confidences))
+            response["routing"] = routing
         return JSONResponse(response)
 
     @litellm_app.get("/dashboard")

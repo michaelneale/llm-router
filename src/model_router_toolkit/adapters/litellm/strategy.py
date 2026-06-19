@@ -33,9 +33,11 @@ from model_router_toolkit.task_view import (
 logger = logging.getLogger(__name__)
 
 EMBEDDING_ROUTED_ALIAS = "embedding-routed"
-EMBEDDING_COMPLEXITY_BANDS = (0.15, 0.35, 0.55, 0.75)
+EMBEDDING_COMPLEXITY_BANDS = (0.15, 0.35, 0.50, 0.54)
 SESSION_HEALTH_MIN_EVENTS = 4
 SESSION_HEALTH_MIN_AGENTIC_EVENTS = 2
+ANTHROPIC_CACHE_CONTROL = {"type": "ephemeral"}
+MAX_ANTHROPIC_CACHE_MARKERS = 4
 
 _request_tolerance: contextvars.ContextVar[float | None] = contextvars.ContextVar(
     "request_tolerance",
@@ -65,6 +67,98 @@ def _normalize_cache_pin_mode(value: Any) -> str:
     if mode is None:
         raise ValueError("cache_pin_mode must be one of: off, dear_only, all")
     return mode
+
+
+def inject_anthropic_cache_markers(
+    deployment: dict[str, Any] | None,
+    messages: list[dict[str, Any]] | None,
+    request_kwargs: dict[str, Any] | None,
+) -> int:
+    """Mirror Goose's Anthropic prompt-cache markers after routing picks Claude."""
+    if not isinstance(deployment, dict):
+        return 0
+    params = deployment.get("litellm_params") or {}
+    if not str(params.get("model") or "").startswith("anthropic/"):
+        return 0
+
+    def count(obj: Any) -> int:
+        if isinstance(obj, dict):
+            return (1 if "cache_control" in obj else 0) + sum(count(v) for v in obj.values())
+        if isinstance(obj, list):
+            return sum(count(v) for v in obj)
+        return 0
+
+    existing = count(messages) + count(request_kwargs)
+    added = 0
+
+    def mark(block: Any) -> bool:
+        nonlocal added
+        if (
+            existing + added >= MAX_ANTHROPIC_CACHE_MARKERS
+            or not isinstance(block, dict)
+            or "cache_control" in block
+        ):
+            return False
+        block["cache_control"] = dict(ANTHROPIC_CACHE_CONTROL)
+        added += 1
+        return True
+
+    def mark_message(message: dict[str, Any]) -> None:
+        nonlocal added
+        if existing + added >= MAX_ANTHROPIC_CACHE_MARKERS:
+            return
+        content = message.get("content")
+        if isinstance(content, str):
+            if content.strip():
+                message["content"] = [
+                    {
+                        "type": "text",
+                        "text": content,
+                        "cache_control": dict(ANTHROPIC_CACHE_CONTROL),
+                    }
+                ]
+                added += 1
+            return
+        if isinstance(content, list):
+            for block in reversed(content):
+                if isinstance(block, dict) and (
+                    block.get("text") or block.get("content") or block.get("type")
+                ):
+                    if mark(block):
+                        return
+
+    if request_kwargs:
+        system = request_kwargs.get("system")
+        if isinstance(system, list) and system:
+            mark(system[0])
+        elif (
+            isinstance(system, str)
+            and system.strip()
+            and existing + added < MAX_ANTHROPIC_CACHE_MARKERS
+        ):
+            request_kwargs["system"] = [
+                {
+                    "type": "text",
+                    "text": system,
+                    "cache_control": dict(ANTHROPIC_CACHE_CONTROL),
+                }
+            ]
+            added += 1
+
+        tools = request_kwargs.get("tools")
+        if isinstance(tools, list) and tools:
+            mark(tools[-1])
+
+    if messages:
+        seen: set[int] = set()
+        for idx in (max(0, len(messages) - 5), len(messages) - 1):
+            if idx in seen:
+                continue
+            seen.add(idx)
+            if existing + added >= MAX_ANTHROPIC_CACHE_MARKERS:
+                break
+            mark_message(messages[idx])
+    return added
 
 
 class ModelRoutingStrategy:
@@ -99,6 +193,8 @@ class ModelRoutingStrategy:
         self._last_result: RoutingResult | None = None
         self._results_by_request: dict[str, RoutingResult] = {}
         self._session_selected: dict[str, str] = {}
+        self._turbo_until = 0.0
+        self._turbo_duration_seconds = 1800.0
         self._state_lock = threading.Lock()
         # Last model we actually routed to, kept as a process-wide debug mirror.
         # Pinning uses _session_selected instead.
@@ -250,6 +346,32 @@ class ModelRoutingStrategy:
     @cache_pin_min_blend.setter
     def cache_pin_min_blend(self, value: float) -> None:
         self._cache_pin_min_blend = max(0.0, float(value))
+
+    def set_turbo(self, *, enabled: bool, duration_seconds: float = 1800.0) -> dict[str, Any]:
+        duration = max(1.0, float(duration_seconds))
+        with self._state_lock:
+            if enabled:
+                self._turbo_duration_seconds = duration
+                self._turbo_until = time.time() + duration
+            else:
+                self._turbo_until = 0.0
+        return self.turbo_state()
+
+    def turbo_state(self) -> dict[str, Any]:
+        now = time.time()
+        with self._state_lock:
+            until = float(self._turbo_until or 0.0)
+            duration = float(self._turbo_duration_seconds or 1800.0)
+            if until and until <= now:
+                self._turbo_until = 0.0
+                until = 0.0
+        remaining = max(0.0, until - now)
+        return {
+            "active": remaining > 0,
+            "remaining_seconds": int(round(remaining)),
+            "until_ts": until if remaining > 0 else 0.0,
+            "duration_seconds": int(round(duration)),
+        }
 
     @property
     def last_result(self) -> RoutingResult | None:
@@ -581,12 +703,15 @@ class ModelRoutingStrategy:
                 return None
             task_view = score.rendered
             ladder = self._embedding_ladder(allowed)
+            rung_index = ladder.index(selected) + 1 if selected in ladder else None
             metadata = {
                 "router_mode": router_mode,
                 "complexity": round(float(score.complexity), 4),
                 "tool_calls_norm": round(float(score.tool_calls_norm), 4),
                 "elapsed_ms": int(score.elapsed_ms),
                 "ladder": ladder,
+                "rung_index": rung_index,
+                "rung_count": len(ladder),
             }
         except Exception as exc:
             logger.exception("Embedding routing failed; falling back to dearest model")
@@ -850,6 +975,48 @@ class ModelRoutingStrategy:
         )
         return self._find_deployment(pin)
 
+    def _try_turbo(
+        self,
+        *,
+        session_key: str,
+        request_id: str | None,
+        messages: list[dict] | None,
+        task_view: str,
+        allowed: list[str] | None,
+    ) -> dict | None:
+        turbo = self.turbo_state()
+        if not turbo["active"]:
+            return None
+        model_name = self._session_health_top_model(allowed)
+        dep = self._find_deployment(model_name) if model_name else None
+        if dep is None:
+            return None
+        result = self._router.resolve(model_name)
+        if result is None:
+            return dep
+        result.metadata["escalated"] = True
+        result.metadata["turbo"] = turbo
+        self._set_last_selected(session_key, model_name)
+        self._store_result(request_id, result)
+        self._log_route(
+            request_id=request_id,
+            session_key=session_key,
+            decision="turbo_escalation",
+            result=result,
+            task_view=task_view,
+            messages=messages,
+            extra={
+                "turbo_remaining_seconds": turbo["remaining_seconds"],
+                "allowed_models": allowed,
+            },
+        )
+        logger.info(
+            "Turbo mode %.0fs remaining -> %s",
+            turbo["remaining_seconds"],
+            model_name,
+        )
+        return dep
+
     def _route_and_select(
         self,
         model: str,
@@ -862,6 +1029,18 @@ class ModelRoutingStrategy:
         session_key = self._session_key(messages, request_kwargs)
         req_models = self._metadata(request_kwargs).get("models")
         allowed = req_models or self._models
+        raw_text = self._extract_user_text(messages).strip()
+        embedding_request = self._is_embedding_request(model, request_kwargs)
+
+        dep = self._try_turbo(
+            session_key=session_key,
+            request_id=request_id,
+            messages=messages,
+            task_view=raw_text,
+            allowed=allowed,
+        )
+        if dep:
+            return dep
 
         # Explicit pin via metadata — for router-per-subagent flows.
         dep = self._try_pin(
@@ -878,8 +1057,6 @@ class ModelRoutingStrategy:
         # agent narration). By default we still route those turns rather than
         # blindly pinning to the incumbent; optional cache-pin modes can preserve
         # the incumbent only for dear models, or for every model.
-        raw_text = self._extract_user_text(messages).strip()
-
         if is_goose_title_request(raw_text):
             dep = self._select_utility_model(
                 session_key=session_key,
@@ -892,7 +1069,11 @@ class ModelRoutingStrategy:
             if dep is not None:
                 return dep
 
-        if self._cheap_utility(raw_text) and self._get_last_selected(session_key) is None:
+        if (
+            not embedding_request
+            and self._cheap_utility(raw_text)
+            and self._get_last_selected(session_key) is None
+        ):
             dep = self._select_utility_model(
                 session_key=session_key,
                 request_id=request_id,
@@ -905,7 +1086,7 @@ class ModelRoutingStrategy:
             if dep is not None:
                 return dep
 
-        if is_info_only_request(raw_text):
+        if not embedding_request and is_info_only_request(raw_text):
             pinned = self._pin_to_last(session_key, request_id, messages, "")
             if pinned is not None:
                 return pinned
@@ -922,6 +1103,7 @@ class ModelRoutingStrategy:
                 return dep
 
         text = build_task_view(messages)
+        is_real_routing_turn = text is not None
         if text is None:
             pinned = self._pin_to_last(session_key, request_id, messages, "")
             if pinned is not None:
@@ -962,7 +1144,7 @@ class ModelRoutingStrategy:
                 logger.info("Escalation policy -> %s", self._escalation_model)
                 return dep
 
-        health = self._score_session_health(messages, task=text)
+        health = self._score_session_health(messages, task=text) if is_real_routing_turn else None
         if health is not None and health.should_escalate:
             model_name = self._session_health_top_model(allowed)
             dep = self._find_deployment(model_name) if model_name else None
@@ -1006,7 +1188,7 @@ class ModelRoutingStrategy:
                 "session_health_threshold": round(float(health.threshold), 4),
             }
 
-        if self._is_embedding_request(model, request_kwargs):
+        if embedding_request:
             dep = self._route_embedding(
                 request_id=request_id,
                 session_key=session_key,
@@ -1065,13 +1247,15 @@ class ModelRoutingStrategy:
         specific_deployment: bool | None = False,
         request_kwargs: dict | None = None,
     ) -> dict:
-        return await asyncio.to_thread(
+        dep = await asyncio.to_thread(
             self._route_and_select,
             model,
             messages,
             input,
             request_kwargs,
         )
+        inject_anthropic_cache_markers(dep, messages, request_kwargs)
+        return dep
 
     def get_available_deployment(
         self,
@@ -1081,7 +1265,9 @@ class ModelRoutingStrategy:
         specific_deployment: bool | None = False,
         request_kwargs: dict | None = None,
     ) -> dict:
-        return self._route_and_select(model, messages, input, request_kwargs)
+        dep = self._route_and_select(model, messages, input, request_kwargs)
+        inject_anthropic_cache_markers(dep, messages, request_kwargs)
+        return dep
 
     def set_litellm_router(self, litellm_router: Any) -> None:
         """Called internally when plugged into a litellm.Router."""

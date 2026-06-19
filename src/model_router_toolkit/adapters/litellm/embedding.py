@@ -9,6 +9,7 @@ from __future__ import annotations
 import hashlib
 import json
 import os
+import re
 import tempfile
 import time
 import urllib.error
@@ -19,8 +20,13 @@ from typing import Any
 
 import numpy as np
 
+from model_router_toolkit.task_view import strip_info_messages
+
 ANCHOR_MARKER = ">>>"
 DEFAULT_MAX_SEQ_LEN = 512
+EMBEDDING_RECENT_EVENTS = 6
+EMBEDDING_SNIPPET_CHARS = 220
+EMBEDDING_RENDER_CHARS = 1400
 DEFAULT_ARTIFACT_REPO = "micdn/llm-router-goose-public"
 DEFAULT_ARTIFACT_PREFIX = "embedding/complexity_model"
 MINIMUM_BUNDLE_FILES = (
@@ -65,32 +71,30 @@ def default_artifact_prefix() -> str:
 def render_messages_for_embedding(messages: list[dict] | None) -> str:
     """Render OpenAI-format messages like the embedding training/runtime contract.
 
-    We keep user/assistant turns through the last user turn and mark that final
-    user turn with ``>>>``. Tool/system messages are omitted for this first proxy
-    spike, matching the minimal Goose-side runtime.
+    We mark the most recent real user task with ``>>>``. Goose often appends
+    info-only user turns after tool calls; those are not user intent, but the
+    tool/assistant tail is still important for routing. Keep a compact recent
+    state tail so scores can move as the agent starts failing or recovering.
     """
     if not messages:
         return ""
 
-    anchor_idx = None
-    for i in range(len(messages) - 1, -1, -1):
-        if messages[i].get("role") == "user" and _content_text(messages[i].get("content")):
-            anchor_idx = i
-            break
-    if anchor_idx is None:
+    real_users: list[tuple[int, str]] = []
+    for i, msg in enumerate(messages):
+        if msg.get("role") != "user":
+            continue
+        text = strip_info_messages(_content_text(msg.get("content"))).strip()
+        if text:
+            real_users.append((i, text))
+    if not real_users:
         return ""
 
-    lines: list[str] = []
-    for i, msg in enumerate(messages[: anchor_idx + 1]):
-        role = msg.get("role")
-        if role not in {"user", "assistant"}:
-            continue
-        text = _content_text(msg.get("content")).strip()
-        if not text:
-            continue
-        prefix = f"{ANCHOR_MARKER} " if i == anchor_idx else ""
-        lines.append(f"{prefix}{role}: {text}")
-    return "\n".join(lines)
+    anchor_idx, anchor_text = real_users[-1]
+    anchor_line = (
+        f"{ANCHOR_MARKER} user: {_clip(_collapse(anchor_text), EMBEDDING_SNIPPET_CHARS)}"
+    )
+    tail = _recent_state_lines(messages[anchor_idx + 1 :])
+    return _fit_embedding_render(anchor_line, tail)
 
 
 def _content_text(content: Any) -> str:
@@ -99,10 +103,95 @@ def _content_text(content: Any) -> str:
     if isinstance(content, list):
         parts = []
         for item in content:
-            if isinstance(item, dict) and item.get("type") == "text":
+            if not isinstance(item, dict):
+                continue
+            if item.get("type") == "text":
                 parts.append(str(item.get("text") or ""))
+            elif item.get("type") in {"tool_result", "toolResponse"}:
+                parts.append(str(item.get("content") or item.get("text") or ""))
         return " ".join(parts)
     return ""
+
+
+_STATE_LINE_RE = re.compile(
+    r"(error|failed|failure|panic|panicked|exception|traceback|exit code|"
+    r"warning|finished|running|pending|skipping|lint|build|check|test|"
+    r"compil|wrote|updated|fixed|passed)",
+    re.IGNORECASE,
+)
+
+
+def _collapse(text: str) -> str:
+    return re.sub(r"\s+", " ", text).strip()
+
+
+def _clip(text: str, limit: int) -> str:
+    text = text.strip()
+    if len(text) <= limit:
+        return text
+    return text[: max(0, limit - 1)].rstrip() + "…"
+
+
+def _salient_tool_text(text: str) -> str:
+    lines = [_collapse(line) for line in text.splitlines()]
+    lines = [line for line in lines if line]
+    if not lines:
+        return _collapse(text)
+    salient = [line for line in lines if _STATE_LINE_RE.search(line)]
+    chosen = salient[:3] if salient else lines[-3:]
+    return " | ".join(chosen)
+
+
+def _fit_embedding_render(anchor_line: str, tail: list[str]) -> str:
+    lines = [anchor_line]
+    if not tail:
+        return _clip(anchor_line, EMBEDDING_RENDER_CHARS)
+
+    header = "--- recent agent state ---"
+    fixed = "\n".join([anchor_line, header])
+    budget = EMBEDDING_RENDER_CHARS - len(fixed) - 1
+    selected: list[str] = []
+    used = 0
+    for line in reversed(tail):
+        line_cost = len(line) + (1 if selected else 0)
+        if selected and used + line_cost > budget:
+            break
+        if not selected and line_cost > budget:
+            selected.append(_clip(line, max(0, budget)))
+            break
+        selected.append(line)
+        used += line_cost
+    selected.reverse()
+    lines.append(header)
+    lines.extend(selected)
+    return "\n".join(lines)
+
+
+def _recent_state_lines(messages: list[dict]) -> list[str]:
+    events: list[str] = []
+    for msg in messages:
+        role = msg.get("role")
+        text = _content_text(msg.get("content"))
+        if role == "user":
+            text = strip_info_messages(text)
+            if not text:
+                continue
+            label = "user"
+        elif role == "assistant":
+            if not text:
+                continue
+            label = "assistant"
+        elif role == "tool":
+            if not text:
+                continue
+            text = _salient_tool_text(text)
+            label = "tool"
+        else:
+            continue
+        text = _clip(_collapse(text), EMBEDDING_SNIPPET_CHARS)
+        if text:
+            events.append(f"{label}: {text}")
+    return events[-EMBEDDING_RECENT_EVENTS:]
 
 
 class EmbeddingComplexityScorer:
