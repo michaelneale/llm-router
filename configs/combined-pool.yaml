@@ -9,8 +9,8 @@
 # Important: `name` is the checkpoint slot and must not change without retraining.
 # `display_name` / `litellm_model` are the current provider models we serve in
 # that slot. This aggressive pool uses Claude Opus 4.8 as the frontier/top
-# escalation slot, caps the high automatic slot at GPT-5.4 Mini, and uses GPT
-# mini/nano variants plus a GPT-5.4 Mini cap before Sonnet. Default tolerance
+# escalation slot, uses Claude Haiku 4.5 as the mid rung, and uses GPT
+# mini/nano variants below it. Default tolerance
 # is the quality point (0.04); use the dashboard or ROUTER_TOLERANCE for
 # higher-savings experiments.
 routing:
@@ -73,25 +73,25 @@ models:
     cost_per_m_input_tokens: 0.25
     cost_per_m_output_tokens: 2.00
   - name: gpt-oss-120b-high
-    display_name: GPT-5.4 Mini
-    litellm_model: openai/gpt-5.4-mini
-    cost_per_m_input_tokens: 0.75
-    cost_per_m_output_tokens: 4.50
+    display_name: Claude Haiku 4.5
+    litellm_model: anthropic/claude-haiku-4-5-20251001
+    cost_per_m_input_tokens: 1.00
+    cost_per_m_output_tokens: 5.00
   - name: gpt-4-1-mini-high
-    display_name: GPT-5.4 Mini
-    litellm_model: openai/gpt-5.4-mini
-    cost_per_m_input_tokens: 0.75
-    cost_per_m_output_tokens: 4.50
+    display_name: Claude Haiku 4.5
+    litellm_model: anthropic/claude-haiku-4-5-20251001
+    cost_per_m_input_tokens: 1.00
+    cost_per_m_output_tokens: 5.00
   - name: claude-sonnet-4-6-high
     display_name: Claude Sonnet 4.6
     litellm_model: anthropic/claude-sonnet-4-6
     cost_per_m_input_tokens: 3.00
     cost_per_m_output_tokens: 15.00
   - name: claude-haiku-4-5-high
-    display_name: GPT-5.4 Mini Cap
-    litellm_model: openai/gpt-5.4-mini
-    cost_per_m_input_tokens: 0.75
-    cost_per_m_output_tokens: 4.50
+    display_name: Claude Haiku 4.5
+    litellm_model: anthropic/claude-haiku-4-5-20251001
+    cost_per_m_input_tokens: 1.00
+    cost_per_m_output_tokens: 5.00
   - name: claude-opus-4-6-high
     display_name: Claude Opus 4.8
     litellm_model: anthropic/claude-opus-4-8

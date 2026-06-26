@@ -33,7 +33,7 @@ from model_router_toolkit.task_view import (
 logger = logging.getLogger(__name__)
 
 EMBEDDING_ROUTED_ALIAS = "embedding-routed"
-EMBEDDING_COMPLEXITY_BANDS = (0.15, 0.35, 0.50, 0.54)
+EMBEDDING_COMPLEXITY_BANDS = (0.30, 0.35, 0.48, 0.55)
 SESSION_HEALTH_MIN_EVENTS = 4
 SESSION_HEALTH_MIN_AGENTIC_EVENTS = 2
 ANTHROPIC_CACHE_CONTROL = {"type": "ephemeral"}

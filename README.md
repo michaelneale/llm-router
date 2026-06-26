@@ -165,7 +165,7 @@ The default path is `configs/combined-pool.yaml`:
 
 The current config is intentionally aggressive for real Goose trials:
 
-- tolerance `0.145`
+- tolerance `0.04`
 - top escalation model: `anthropic/claude-opus-4-8`
 - manual hard override: prefix a task with `!hard`
 - session-health escalation: enabled at threshold `0.88`
@@ -177,7 +177,7 @@ Provider models in the active ladder:
 |---|---|
 | cheapest | `openai/gpt-5-nano` |
 | cheap | `openai/gpt-5-mini` |
-| high-mini / capped mid | `openai/gpt-5.4-mini` |
+| mid | `anthropic/claude-haiku-4-5-20251001` |
 | strong | `anthropic/claude-sonnet-4-6` |
 | top | `anthropic/claude-opus-4-8` |
 
